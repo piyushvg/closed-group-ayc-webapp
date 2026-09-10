@@ -28,8 +28,7 @@ const FRAPPE_API_SECRET = process.env.FRAPPE_API_SECRET;
 
 // 🔴 PLACEHOLDER — replace once backend confirms the real method name.
 const FRAPPE_CREATE_MEMBER_PATH =
-  "/api/method/community_circle_app.community_circle.api.members_api.create_member";
-
+  "/api/method/community_circle_app.community_circle.api.create_member.create_member";
 export async function POST(request) {
   if (!FRAPPE_BASE_URL || !FRAPPE_API_KEY || !FRAPPE_API_SECRET) {
     return Response.json(

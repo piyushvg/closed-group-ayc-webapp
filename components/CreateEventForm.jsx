@@ -3,13 +3,15 @@
 // (navigator.geolocation).
 
 import React, { useState } from "react";
+import MapPicker from './MapPicker';
 
 /**
  * CreateEventForm
  * ----------------
  * Styled to match MemberProfileForm.jsx (same card look, same
  * required-field red-highlight behaviour, same "Use current location"
- * pattern for lat/lng).
+ * pattern for lat/lng — plus a MapPicker so organizers can drop/drag a pin
+ * instead of typing lat/lng by hand).
  *
  * Wired to POST /api/event, which is a Next.js API route that forwards to
  * the real Frappe endpoint:
@@ -55,6 +57,11 @@ export default function CreateEventForm({
       },
       () => {
         setBanner({ type: "error", text: "Couldn't read your location — check browser permission." });
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
       }
     );
   };
@@ -125,7 +132,8 @@ export default function CreateEventForm({
   };
 
   return (
-    <div className="cef-page">
+    <div className="cef-outer">
+      <div className="cef-page">
       <style>{CSS}</style>
 
       <header className="cef-head">
@@ -190,6 +198,20 @@ export default function CreateEventForm({
               />
             </Field>
 
+            {/* Map picker — was accidentally left floating inside the
+                function body earlier, referencing an undefined
+                `event`/`setEvent`. Fixed: lives here in the render JSX,
+                wired to this component's actual `form`/`set` state. */}
+            <div className="cef-field-full">
+              <MapPicker
+                initialLat={form.latitude}
+                initialLng={form.longitude}
+                onLocationSelect={(lat, lng) =>
+                  set({ latitude: String(lat), longitude: String(lng) })
+                }
+              />
+            </div>
+
             <div className="cef-geo-row">
               <Field label="Latitude">
                 <input
@@ -223,6 +245,7 @@ export default function CreateEventForm({
           </button>
         </div>
       </form>
+      </div>
     </div>
   );
 }
@@ -247,12 +270,20 @@ function Field({ label, required, full, error, children }) {
 }
 
 const CSS = `
-  .cef-page {
+  /* Full-width wrapper: carries the background edge-to-edge so there's no
+     black/blank strip on either side on wide laptop screens. Content
+     itself still sits in a max-width column below. */
+  .cef-outer {
     --border: #B9B6AC; --border-light: #D8D5CB; --surface: #FAF9F5;
     --card: #FFFFFF; --text: #2B2A27; --text-muted: #7A776E; --accent: #B3413A;
-    max-width: 760px; margin: 0 auto; padding: 32px 16px 80px;
+    width: 100%;
+    min-height: 100vh;
+    background: var(--surface);
+    color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    color: var(--text); background: var(--surface);
+  }
+  .cef-page {
+    max-width: 1100px; margin: 0 auto; padding: 32px 16px 80px;
   }
   .cef-head { margin-bottom: 20px; }
   .cef-head h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
@@ -265,7 +296,7 @@ const CSS = `
   .cef-banner-success { background: #EAF3EA; color: #2E6B3E; border: 1px solid #C9E0C9; }
 
   .cef-card { background: var(--card); border: 1px solid var(--border-light); border-radius: 10px; padding: 20px 22px; margin-bottom: 16px; }
-  .cef-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px 16px; }
+  .cef-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px 16px; }
   .cef-field { display: flex; flex-direction: column; gap: 4px; }
   .cef-field-full { grid-column: 1 / -1; }
   .cef-field label { font-size: 12px; color: var(--text-muted); }
@@ -293,4 +324,19 @@ const CSS = `
   .cef-cancel { background: var(--card); border: 1px solid var(--border); color: var(--text); }
   .cef-save { background: var(--text); border: none; color: #fff; font-weight: 600; }
   .cef-save:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* Responsive: 4 columns is a laptop/desktop layout, stepping down as
+     the viewport shrinks so fields never get squeezed unreadably narrow. */
+  @media (max-width: 900px) {
+    .cef-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  }
+  @media (max-width: 560px) {
+    .cef-grid { grid-template-columns: 1fr; }
+    .cef-page { padding: 20px 12px 60px; }
+    .cef-card { padding: 16px; }
+    .cef-geo-row { flex-direction: column; align-items: stretch; }
+    .cef-geo-btn { width: 100%; }
+    .cef-actions { flex-direction: column-reverse; }
+    .cef-actions button { width: 100%; }
+  }
 `;

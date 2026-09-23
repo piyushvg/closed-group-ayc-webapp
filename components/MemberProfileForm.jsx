@@ -4,6 +4,8 @@
 // client, not the server.
 
 import React, { useState, useCallback } from "react";
+import MapPicker from './MapPicker';
+
 
 /**
  * MemberProfileForm
@@ -14,10 +16,14 @@ import React, { useState, useCallback } from "react";
  *  - All fields from the wireframe as controlled state
  *  - Conditional sections: Board designation, Wife's section (married),
  *    Wife's business (profession !== housewife), "Same as Husband" address copy
+ *  - Member profession dropdown (Housewife / Business / Service):
+ *      Business  -> shows the Business section
+ *      Service   -> shows the Service section (Company, Sector, Designation)
+ *      Housewife -> nothing extra
  *  - Children repeater (add / remove, capped at 4)
  *  - Geolocation capture button (📍 Use current location) for each address block
- *  - Lat/Lng fields that a parent Map-picker component can prefill via the
- *    `initialValues` prop (see MAP INTEGRATION note near the bottom)
+ *  - A MapPicker for the business address so members can drop/drag a pin
+ *    instead of (or alongside) typing lat/lng manually
  *  - Basic required-field validation
  *  - Submit handler that POSTs to an API (multipart/form-data, so photo
  *    files travel with the rest of the payload)
@@ -55,6 +61,12 @@ const initialFormState = {
     isInBoard: false,
     boardDesignation: "",
     isMarried: true,
+    profession: "", // "" | "Housewife" | "Business" | "Service"
+  },
+  service: {
+    company: "",
+    sector: "",
+    designation: "",
   },
   business: {
     name: "",
@@ -157,6 +169,10 @@ export default function MemberProfileForm({
     setForm((f) => ({ ...f, ancestry: { ...f.ancestry, ...patch } }));
   }, []);
 
+  const setService = useCallback((patch) => {
+    setForm((f) => ({ ...f, service: { ...f.service, ...patch } }));
+  }, []);
+
   const setWife = useCallback((patch) => {
     setForm((f) => ({ ...f, wife: { ...f.wife, ...patch } }));
   }, []);
@@ -225,12 +241,8 @@ export default function MemberProfileForm({
   };
 
   // ---- geolocation ------------------------------------------------------
-  // MAP INTEGRATION NOTE:
-  // Once you drop in a real map picker, replace/augment this handler so that
-  // choosing a point on the map calls the matching setter (setBusiness,
-  // setWifeResidence, setWifeBusiness) with { lat, lng }. This button-based
-  // browser geolocation capture can stay as a "use my current location" shortcut
-  // alongside the map, or be removed once the map is the only entry point.
+  // The "Use current location" button stays as a shortcut alongside the
+  // MapPicker below — either one calls the matching setter with { lat, lng }.
   const captureLocation = (setter, disabled) => {
     if (disabled) return;
     if (!navigator.geolocation) {
@@ -246,6 +258,16 @@ export default function MemberProfileForm({
       },
       () => {
         setSaveError("Could not get current location (permission denied or unavailable).");
+      },
+      {
+        // Without this, the browser often takes the fast path — resolving
+        // location from Wi-Fi/cell-tower/IP data instead of the device's
+        // actual GPS chip, which can be off by kilometres. This forces it
+        // to wait for a real GPS fix instead, and maximumAge: 0 stops it
+        // from returning an old cached position from earlier in the session.
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
       }
     );
   };
@@ -269,9 +291,18 @@ export default function MemberProfileForm({
     reqMobile(form.member.mobile, "member.mobile");
     if (form.member.isInBoard) req(form.member.boardDesignation, "member.boardDesignation");
 
-    req(form.business.name, "business.name");
-    req(form.business.address1, "business.address1");
-    req(form.business.city, "business.city");
+    req(form.member.profession, "member.profession");
+
+    if (form.member.profession === "Business") {
+      req(form.business.name, "business.name");
+      req(form.business.address1, "business.address1");
+      req(form.business.city, "business.city");
+    }
+
+    if (form.member.profession === "Service") {
+      req(form.service.company, "service.company");
+      req(form.service.designation, "service.designation");
+    }
 
     if (form.member.isMarried) {
       req(form.wife.name, "wife.name");
@@ -303,7 +334,15 @@ export default function MemberProfileForm({
     fd.append("member", JSON.stringify(memberRest));
     if (photo) fd.append("memberPhoto", photo);
 
-    fd.append("business", JSON.stringify(form.business));
+    // Only the section matching the chosen profession is sent.
+    // (`profession` itself already travels inside the "member" JSON above.)
+    if (form.member.profession === "Business") {
+      fd.append("business", JSON.stringify(form.business));
+    }
+    if (form.member.profession === "Service") {
+      fd.append("service", JSON.stringify(form.service));
+    }
+
     fd.append("ancestry", JSON.stringify(form.ancestry));
 
     if (form.member.isMarried) {
@@ -369,7 +408,8 @@ export default function MemberProfileForm({
   };
 
   return (
-    <div className="mpf-page">
+    <div className="mpf-outer">
+      <div className="mpf-page">
       <style>{css}</style>
 
       <header className="mpf-doc-head">
@@ -408,14 +448,13 @@ export default function MemberProfileForm({
               onChange={(e) => setMember({ surname: e.target.value })}
             />
           </Field>
-          <Field label="Date of birth (DD/MM/YY)" required error={errFor("member.dob")}>
-            <input
-              type="text"
-              placeholder="DD/MM/YY"
-              value={form.member.dob}
-              onChange={(e) => setMember({ dob: e.target.value })}
-            />
-          </Field>
+          <DatePickerField
+            label="Date of birth"
+            required
+            error={errFor("member.dob")}
+            value={form.member.dob}
+            onChange={(v) => setMember({ dob: v })}
+          />
           <Field label="Education">
             <input
               type="text"
@@ -450,6 +489,20 @@ export default function MemberProfileForm({
           </Field>
         </div>
 
+        <div className="mpf-grid" style={{ marginTop: 10 }}>
+          <Field label="Profession" required error={errFor("member.profession")}>
+            <select
+              value={form.member.profession}
+              onChange={(e) => setMember({ profession: e.target.value })}
+            >
+              <option value="">Select profession</option>
+              <option value="Housewife">Housewife</option>
+              <option value="Business">Business</option>
+              <option value="Service">Service</option>
+            </select>
+          </Field>
+        </div>
+
         <label className="mpf-inline-toggle">
           <input
             type="checkbox"
@@ -461,11 +514,22 @@ export default function MemberProfileForm({
         {form.member.isInBoard && (
           <div className="mpf-grid" style={{ marginTop: 10 }}>
             <Field label="Board designation" required error={errFor("member.boardDesignation")}>
-              <input
-                type="text"
+              <select
                 value={form.member.boardDesignation}
                 onChange={(e) => setMember({ boardDesignation: e.target.value })}
-              />
+              >
+                <option value="">Select designation</option>
+                <option value="Chairman & Managing Director">Chairman & Managing Director</option>
+                <option value="Directors">Directors</option>
+                <option value="Senior Director">Senior Director</option>
+                <option value="Secretary">Secretary</option>
+                <option value="Joint Secretary">Joint Secretary</option>
+                <option value="President">President</option>
+                <option value="Vice President">Vice President</option>
+                <option value="IPP - Immediate Past President">IPP - Immediate Past President</option>
+                <option value="Executive Director">Executive Director</option>
+                <option value="Treasurer">Treasurer</option>
+              </select>
             </Field>
           </div>
         )}
@@ -480,7 +544,8 @@ export default function MemberProfileForm({
         </label>
       </section>
 
-      {/* 2. Business */}
+      {/* 2. Business — shown only when profession is Business */}
+      {form.member.profession === "Business" && (
       <section className="mpf-card">
         <h2>2. Business</h2>
         <div className="mpf-grid">
@@ -564,15 +629,60 @@ export default function MemberProfileForm({
             />
           </Field>
 
+          {/* Map picker — was accidentally left floating outside any
+              component earlier (referencing an undefined `business`
+              variable). Fixed: lives here in the Business section's JSX,
+              wired to form.business.lat/lng via setBusiness. */}
+          <div className="mpf-field-full">
+            <MapPicker
+              initialLat={form.business.lat}
+              initialLng={form.business.lng}
+              onLocationSelect={(lat, lng) => setBusiness({ lat, lng })}
+            />
+          </div>
+
           <GeoRow
             lat={form.business.lat}
             lng={form.business.lng}
-            onLat={(v) => setBusiness({ lat: v })}
-            onLng={(v) => setBusiness({ lng: v })}
             onUseCurrent={() => captureLocation(setBusiness, false)}
           />
+          <p className="mpf-location-hint">
+            "Use current location" is approximate on laptops/desktops (no GPS chip) —
+            for an exact address, click or drag the pin on the map above instead.
+          </p>
         </div>
       </section>
+      )}
+
+      {/* 2. Service — shown only when profession is Service */}
+      {form.member.profession === "Service" && (
+        <section className="mpf-card">
+          <h2>2. Service</h2>
+          <div className="mpf-grid mpf-cols-3">
+            <Field label="Company" required error={errFor("service.company")}>
+              <input
+                type="text"
+                value={form.service.company}
+                onChange={(e) => setService({ company: e.target.value })}
+              />
+            </Field>
+            <Field label="Sector">
+              <input
+                type="text"
+                value={form.service.sector}
+                onChange={(e) => setService({ sector: e.target.value })}
+              />
+            </Field>
+            <Field label="Designation" required error={errFor("service.designation")}>
+              <input
+                type="text"
+                value={form.service.designation}
+                onChange={(e) => setService({ designation: e.target.value })}
+              />
+            </Field>
+          </div>
+        </section>
+      )}
 
       {/* 3. Ancestry */}
       <section className="mpf-card">
@@ -653,13 +763,11 @@ export default function MemberProfileForm({
                 onChange={(e) => setWife({ altContact: digitsOnly(e.target.value) })}
               />
             </Field>
-            <Field label="Date of birth">
-              <input
-                type="text"
-                value={form.wife.dob}
-                onChange={(e) => setWife({ dob: e.target.value })}
-              />
-            </Field>
+            <DatePickerField
+              label="Date of birth"
+              value={form.wife.dob}
+              onChange={(v) => setWife({ dob: v })}
+            />
             <Field label="Education">
               <input
                 type="text"
@@ -735,12 +843,20 @@ export default function MemberProfileForm({
               />
             </Field>
 
+            {!form.wife.residence.sameAsHusband && (
+              <div className="mpf-field-full">
+                <MapPicker
+                  initialLat={form.wife.residence.lat}
+                  initialLng={form.wife.residence.lng}
+                  onLocationSelect={(lat, lng) => setWifeResidence({ lat, lng })}
+                />
+              </div>
+            )}
+
             <GeoRow
               lat={form.wife.residence.lat}
               lng={form.wife.residence.lng}
               disabled={form.wife.residence.sameAsHusband}
-              onLat={(v) => setWifeResidence({ lat: v })}
-              onLng={(v) => setWifeResidence({ lng: v })}
               onUseCurrent={() => captureLocation(setWifeResidence, form.wife.residence.sameAsHusband)}
             />
           </div>
@@ -840,12 +956,20 @@ export default function MemberProfileForm({
                   />
                 </Field>
 
+                {!form.wife.business.sameAsHusband && (
+                  <div className="mpf-field-full">
+                    <MapPicker
+                      initialLat={form.wife.business.lat}
+                      initialLng={form.wife.business.lng}
+                      onLocationSelect={(lat, lng) => setWifeBusiness({ lat, lng })}
+                    />
+                  </div>
+                )}
+
                 <GeoRow
                   lat={form.wife.business.lat}
                   lng={form.wife.business.lng}
                   disabled={form.wife.business.sameAsHusband}
-                  onLat={(v) => setWifeBusiness({ lat: v })}
-                  onLng={(v) => setWifeBusiness({ lng: v })}
                   onUseCurrent={() => captureLocation(setWifeBusiness, form.wife.business.sameAsHusband)}
                 />
               </div>
@@ -880,13 +1004,11 @@ export default function MemberProfileForm({
                     onChange={(e) => setChild(i, { name: e.target.value })}
                   />
                 </Field>
-                <Field label="Date of birth">
-                  <input
-                    type="text"
-                    value={child.dob}
-                    onChange={(e) => setChild(i, { dob: e.target.value })}
-                  />
-                </Field>
+                <DatePickerField
+                  label="Date of birth"
+                  value={child.dob}
+                  onChange={(v) => setChild(i, { dob: v })}
+                />
                 <Field label="Education">
                   <input
                     type="text"
@@ -930,6 +1052,7 @@ export default function MemberProfileForm({
           {saving ? "Saving…" : "Save member"}
         </button>
       </div>
+      </div>
     </div>
   );
 }
@@ -955,30 +1078,148 @@ function Field({ label, required, full, error, children }) {
   );
 }
 
-function GeoRow({ lat, lng, disabled, onLat, onLng, onUseCurrent }) {
+// Deliberately does NOT render the raw lat/lng numbers — the member only
+// ever sees a status ("Location set" / "No location set") and picks the
+// spot visually (map pin or this button). The actual coordinates still
+// live in form state exactly as before and travel to the backend via the
+// normal save payload (buildFormData/saveMember) — they're just never
+// shown on screen.
+function GeoRow({ lat, lng, disabled, onUseCurrent }) {
+  const hasLocation = !!(lat && lng);
   return (
     <div className="mpf-geo-row">
-      <Field label="Latitude">
-        <input
-          type="text"
-          placeholder="e.g. 23.0225"
-          disabled={disabled}
-          value={lat}
-          onChange={(e) => onLat(e.target.value)}
-        />
-      </Field>
-      <Field label="Longitude">
-        <input
-          type="text"
-          placeholder="e.g. 72.5714"
-          disabled={disabled}
-          value={lng}
-          onChange={(e) => onLng(e.target.value)}
-        />
-      </Field>
+      <div className="mpf-geo-status">
+        <span className={"mpf-geo-dot" + (hasLocation ? " mpf-geo-dot-set" : "")} aria-hidden="true" />
+        <span className="mpf-geo-status-text">
+          {hasLocation ? "📍 Location set" : "No location set yet"}
+        </span>
+      </div>
       <button type="button" className="mpf-geo-btn" disabled={disabled} onClick={onUseCurrent}>
-        📍 Use current location
+        Use current location
       </button>
+    </div>
+  );
+}
+
+// ---- custom calendar date picker ---------------------------------------
+// Renders its own dropdown calendar instead of relying on the browser's
+// native <input type="date"> UI (which on some setups shows no visible
+// calendar icon/button, leaving people unable to pick a date with the
+// mouse at all). Stores/returns the same "YYYY-MM-DD" string either way,
+// so setMember({ dob }) etc. don't need to change.
+
+const DP_MONTHS = [
+  "January","February","March","April","May","June",
+  "July","August","September","October","November","December",
+];
+const DP_WEEKDAYS = ["S","M","T","W","T","F","S"];
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+function isoToDisplay(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-");
+  if (!y || !m || !d) return "";
+  return `${d}/${m}/${y}`;
+}
+
+function buildCalendarWeeks(year, month) {
+  const firstDay = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells = [
+    ...Array(firstDay).fill(null),
+    ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
+  ];
+  while (cells.length % 7 !== 0) cells.push(null);
+  const weeks = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  return weeks;
+}
+
+function DatePickerField({ label, value, onChange, required, error }) {
+  const [open, setOpen] = useState(false);
+  const today = new Date();
+  const parsed = value ? new Date(value) : null;
+  const [viewYear, setViewYear] = useState((parsed && !isNaN(parsed)) ? parsed.getFullYear() : today.getFullYear());
+  const [viewMonth, setViewMonth] = useState((parsed && !isNaN(parsed)) ? parsed.getMonth() : today.getMonth());
+  const wrapRef = React.useRef(null);
+
+  React.useEffect(() => {
+    function onOutside(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    }
+    if (open) document.addEventListener("mousedown", onOutside);
+    return () => document.removeEventListener("mousedown", onOutside);
+  }, [open]);
+
+  function pick(day) {
+    const iso = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(day)}`;
+    onChange(iso);
+    setOpen(false);
+  }
+
+  function goPrev() {
+    if (viewMonth === 0) { setViewMonth(11); setViewYear((y) => y - 1); } else { setViewMonth((m) => m - 1); }
+  }
+  function goNext() {
+    if (viewMonth === 11) { setViewMonth(0); setViewYear((y) => y + 1); } else { setViewMonth((m) => m + 1); }
+  }
+
+  const weeks = buildCalendarWeeks(viewYear, viewMonth);
+
+  return (
+    <div
+      className={"mpf-field" + (error ? " mpf-field-error" : "")}
+      ref={wrapRef}
+      style={{ position: "relative" }}
+    >
+      <label>
+        {label}
+        {required && <span className="mpf-req"> *</span>}
+      </label>
+      <button
+        type="button"
+        className="mpf-date-trigger"
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span style={{ color: value ? "var(--text)" : "var(--text-muted)" }}>
+          {value ? isoToDisplay(value) : "DD/MM/YYYY"}
+        </span>
+        <span aria-hidden="true">📅</span>
+      </button>
+      {error && <span className="mpf-field-error-text">{error}</span>}
+
+      {open && (
+        <div className="mpf-date-popover">
+          <div className="mpf-date-popover-head">
+            <button type="button" onClick={goPrev} className="mpf-date-nav">‹</button>
+            <span>{DP_MONTHS[viewMonth]} {viewYear}</span>
+            <button type="button" onClick={goNext} className="mpf-date-nav">›</button>
+          </div>
+          <div className="mpf-date-weekrow">
+            {DP_WEEKDAYS.map((w, i) => <span key={i}>{w}</span>)}
+          </div>
+          {weeks.map((week, wi) => (
+            <div className="mpf-date-weekrow" key={wi}>
+              {week.map((day, di) => {
+                if (day === null) return <span key={di} className="mpf-date-cell" />;
+                const iso = `${viewYear}-${pad2(viewMonth + 1)}-${pad2(day)}`;
+                const isSelected = iso === value;
+                return (
+                  <button
+                    type="button"
+                    key={di}
+                    className={"mpf-date-cell mpf-date-day" + (isSelected ? " mpf-date-day-selected" : "")}
+                    onClick={() => pick(day)}
+                  >
+                    {day}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -986,7 +1227,12 @@ function GeoRow({ lat, lng, disabled, onLat, onLng, onUseCurrent }) {
 // ---- styles (ported from the wireframe) -------------------------------
 
 const css = `
-  .mpf-page {
+  /* Full-width wrapper: carries the background and fills the whole
+     viewport edge-to-edge, so there's no black/blank strip on either
+     side on wide laptop screens. The actual card content still sits in
+     a max-width column below — this only changes the empty space around
+     it, NOT the 2-column field grid, which stays exactly as it was. */
+  .mpf-outer {
     --border: #B9B6AC;
     --border-light: #D8D5CB;
     --surface: #FAF9F5;
@@ -994,11 +1240,15 @@ const css = `
     --text: #2B2A27;
     --text-muted: #7A776E;
     --accent: #B3413A;
-    max-width: 760px;
-    margin: 0 auto;
+    width: 100%;
+    min-height: 100vh;
     background: var(--surface);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .mpf-page {
+    max-width: 1100px;
+    margin: 0 auto;
     padding: 32px 16px 80px;
   }
   .mpf-page * { box-sizing: border-box; }
@@ -1030,12 +1280,21 @@ const css = `
   .mpf-inline-toggle { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; }
   .mpf-inline-toggle input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
 
-  .mpf-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px 16px; margin-top: 12px; }
+  .mpf-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px 16px; margin-top: 12px; }
   .mpf-cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+
+  /* Responsive: 4 columns is a laptop/desktop layout. Step down as the
+     viewport shrinks so fields never get squeezed unreadably narrow. */
+  @media (max-width: 900px) {
+    .mpf-grid, .mpf-cols-3 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+  }
+  @media (max-width: 560px) {
+    .mpf-grid, .mpf-cols-3 { grid-template-columns: 1fr; }
+  }
   .mpf-field { display: flex; flex-direction: column; gap: 4px; }
   .mpf-field-full { grid-column: 1 / -1; }
   .mpf-field label { font-size: 12px; color: var(--text-muted); }
-  .mpf-field input[type="text"], .mpf-field input[type="file"], .mpf-field select {
+  .mpf-field input[type="text"], .mpf-field input[type="date"], .mpf-field input[type="file"], .mpf-field select {
     height: 34px; border: 1px solid var(--border); border-radius: 6px; padding: 0 10px;
     font-size: 13px; background: var(--card); color: var(--text); width: 100%;
   }
@@ -1044,6 +1303,7 @@ const css = `
   .mpf-field input:disabled, .mpf-field select:disabled { background: #F0EFEA; color: var(--text-muted); }
   .mpf-field-error-text { font-size: 11px; color: var(--accent); font-weight: 600; }
   .mpf-field-error input[type="text"],
+  .mpf-field-error input[type="date"],
   .mpf-field-error input[type="file"],
   .mpf-field-error select {
     border-color: var(--accent) !important;
@@ -1056,12 +1316,16 @@ const css = `
   .mpf-same-as { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; white-space: nowrap; font-size: 12.5px; color: var(--text); }
   .mpf-same-as input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
 
-  .mpf-geo-row { display: flex; align-items: flex-end; gap: 10px; grid-column: 1 / -1; }
-  .mpf-geo-row .mpf-field { flex: 1; }
-  .mpf-geo-btn { height: 34px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; }
+  .mpf-geo-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; grid-column: 1 / -1; }
+  .mpf-geo-status { display: flex; align-items: center; gap: 8px; }
+  .mpf-geo-dot { width: 8px; height: 8px; border-radius: 4px; background: var(--border); flex-shrink: 0; }
+  .mpf-geo-dot-set { background: #2E6B3E; }
+  .mpf-geo-status-text { font-size: 12.5px; color: var(--text-muted); }
+  .mpf-geo-btn { height: 34px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap; }
   .mpf-geo-btn:disabled { color: var(--text-muted); cursor: not-allowed; }
 
   .mpf-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; font-style: italic; }
+  .mpf-location-hint { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); margin: 6px 0 0; font-style: italic; }
 
   .mpf-repeat-block { border: 1px dashed var(--border); border-radius: 8px; padding: 14px 16px; margin-top: 8px; }
   .mpf-repeat-label-row { display: flex; align-items: center; justify-content: space-between; }
@@ -1074,4 +1338,39 @@ const css = `
   .mpf-cancel { background: var(--card); border: 1px solid var(--border) !important; color: var(--text); }
   .mpf-save { background: var(--text); color: #fff; font-weight: 600; }
   .mpf-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* Custom date picker (replaces the native <input type="date">, whose
+     calendar icon doesn't render visibly in every browser/zoom setup) */
+  .mpf-date-trigger {
+    height: 34px; width: 100%; border: 1px solid var(--border); border-radius: 6px;
+    padding: 0 10px; background: var(--card); font-size: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: space-between;
+    font-family: inherit; color: var(--text);
+  }
+  .mpf-date-trigger:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .mpf-field-error .mpf-date-trigger { border-color: var(--accent); border-width: 1.5px; background: #FDF3F2; }
+
+  .mpf-date-popover {
+    position: absolute; top: 100%; left: 0; margin-top: 6px; z-index: 20;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; width: 240px; box-shadow: 0 6px 18px rgba(0,0,0,0.12);
+  }
+  .mpf-date-popover-head {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 8px;
+  }
+  .mpf-date-nav {
+    border: none; background: none; font-size: 16px; cursor: pointer;
+    color: var(--text); width: 24px; height: 24px; border-radius: 4px;
+  }
+  .mpf-date-nav:hover { background: #F0EFEA; }
+  .mpf-date-weekrow { display: flex; justify-content: space-between; margin-bottom: 2px; }
+  .mpf-date-weekrow span { width: 28px; text-align: center; font-size: 10.5px; color: var(--text-muted); }
+  .mpf-date-cell {
+    width: 28px; height: 28px; border: none; background: none; border-radius: 6px;
+    font-size: 12px; color: var(--text); cursor: pointer; display: inline-flex;
+    align-items: center; justify-content: center;
+  }
+  .mpf-date-day:hover { background: #F0EFEA; }
+  .mpf-date-day-selected { background: var(--accent); color: #fff; font-weight: 700; }
 `;

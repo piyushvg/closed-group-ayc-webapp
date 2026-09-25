@@ -29,8 +29,40 @@ To learn more about Next.js, take a look at the following resources:
 
 You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
 
-## Deploy on Vercel
+## Environment
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+All variables are listed in `.env.example`. Env files other than that template are gitignored.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+| File | Used when | Where |
+| --- | --- | --- |
+| `.env.local` | `npm run dev` | your machine |
+| `.env.production.local` | `npm run build` / `npm run start` | prod server |
+
+Next.js load order in production is `.env.production.local` > `.env.local` > `.env.production` > `.env`, so keep **only** `.env.production.local` on the server — a stray `.env.local` there would override prod values.
+
+`NEXT_PUBLIC_*` values are baked into the client bundle at build time; the rest (`FRAPPE_*`, `SESSION_SECRET`) are read at runtime.
+
+## Deploy (own server)
+
+```bash
+# first time
+git clone <repo> ayc-webapp && cd ayc-webapp
+
+# copy prod secrets from your machine (never commit them)
+scp .env.prod user@server:~/ayc-webapp/.env.production.local
+ssh user@server 'chmod 600 ~/ayc-webapp/.env.production.local'
+
+# build + run
+npm ci
+npm run build
+pm2 start npm --name ayc -- start   # serves on :3000; put nginx + HTTPS in front
+```
+
+Updating: `git pull && npm ci && npm run build && pm2 restart ayc`.
+Changed an env value? Edit `.env.production.local` on the server, then rebuild if a `NEXT_PUBLIC_*` value changed, otherwise just `pm2 restart ayc`.
+
+Prod checklist:
+- `SESSION_SECRET` differs from dev.
+- `FRAPPE_BASE_URL` uses `https://`.
+- Prod domain added in Firebase console → Authentication → Settings → Authorized domains.
+- The session cookie gets `Secure` automatically when `NODE_ENV=production` (`lib/session.js`).

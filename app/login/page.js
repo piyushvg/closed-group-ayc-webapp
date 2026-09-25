@@ -54,6 +54,8 @@ export default function LoginPage() {
   async function sendOtp(isResend = false) {
     setError("");
 
+    if (!firebaseAuth) return;
+
     if (mobile.length !== 10) {
       setError("Please enter your 10-digit mobile number.");
       return;

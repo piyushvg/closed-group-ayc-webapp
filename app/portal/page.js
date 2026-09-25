@@ -12,6 +12,7 @@ import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
 import PhotoField from "@/components/PhotoField";
 import MemberProfileForm from "@/components/MemberProfileForm";
+import { withBase } from "@/lib/paths";
 
 export default function PortalPage() {
   const router = useRouter();
@@ -23,10 +24,14 @@ export default function PortalPage() {
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
+    // Stay on the loading screen while bouncing to /login — otherwise the
+    // form renders for a frame with no data.
+    let redirecting = false;
     try {
-      const res = await fetch("/api/member/me", { cache: "no-store" });
+      const res = await fetch(withBase("/api/member/me"), { cache: "no-store" });
 
       if (res.status === 401) {
+        redirecting = true;
         router.replace("/login");
         return;
       }
@@ -44,7 +49,7 @@ export default function PortalPage() {
     } catch (err) {
       setError(err.message || "Something went wrong.");
     } finally {
-      setLoading(false);
+      if (!redirecting) setLoading(false);
     }
   }, [router]);
 
@@ -61,7 +66,7 @@ export default function PortalPage() {
 
       <AppHeader mobileNo={data?.form?.member?.mobile} />
 
-      {loading ? (
+      {loading || (!data && !error) ? (
         <div className="portal-state">Loading your details…</div>
       ) : error ? (
         <div className="portal-state portal-state-error">

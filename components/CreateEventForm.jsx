@@ -4,6 +4,7 @@
 
 import React, { useState } from "react";
 import MapPicker from './MapPicker';
+import { withBase } from "@/lib/paths";
 
 /**
  * CreateEventForm
@@ -89,7 +90,7 @@ export default function CreateEventForm({
 
     setSaving(true);
     try {
-      const res = await fetch(apiEndpoint, {
+      const res = await fetch(withBase(apiEndpoint), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

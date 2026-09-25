@@ -1,5 +1,6 @@
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { withBase } from "@/lib/paths";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -14,7 +15,7 @@ const geistMono = Geist_Mono({
 export const metadata = {
   title: "AYC Member Portal",
   description: "Sign in to view and update your AYC member profile.",
-  icons: { icon: "/ayc-logo.png" },
+  icons: { icon: withBase("/ayc-logo.png") },
 };
 
 export default function RootLayout({ children }) {

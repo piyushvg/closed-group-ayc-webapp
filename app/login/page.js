@@ -17,6 +17,7 @@ import {
   signInWithPhoneNumber,
 } from "firebase/auth";
 import { firebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
+import { withBase } from "@/lib/paths";
 
 const OTP_LENGTH = 6;
 const RESEND_SECONDS = 30;
@@ -103,7 +104,7 @@ export default function LoginPage() {
       const credential = await confirmationRef.current.confirm(otp);
       const firebaseToken = await credential.user.getIdToken();
 
-      const res = await fetch("/api/auth/verify", {
+      const res = await fetch(withBase("/api/auth/verify"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ firebaseToken }),
@@ -126,7 +127,7 @@ export default function LoginPage() {
 
       <div className="login-card">
         <div className="login-brand">
-          <Image src="/ayc-logo.png" alt="AYC" width={56} height={56} priority />
+          <Image src={withBase("/ayc-logo.png")} alt="AYC" width={56} height={56} priority />
           <div>
             <h1>Member portal</h1>
             <p>Sign in with the mobile number registered with the club.</p>

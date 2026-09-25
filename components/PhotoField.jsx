@@ -12,6 +12,7 @@
 // fills the form over two sittings doesn't lose the photo they just took.
 
 import { useEffect, useRef, useState } from "react";
+import { withBase } from "@/lib/paths";
 
 export default function PhotoField({
   label,
@@ -49,7 +50,7 @@ export default function PhotoField({
       fd.append("file", file);
       fd.append("kind", kind);
 
-      const res = await fetch("/api/member/photo", { method: "POST", body: fd });
+      const res = await fetch(withBase("/api/member/photo"), { method: "POST", body: fd });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.message || `Upload failed (HTTP ${res.status})`);
 

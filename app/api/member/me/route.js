@@ -8,11 +8,14 @@
 // profile just by changing an id in devtools.
 
 import { frappePost, FRAPPE_METHODS } from "@/lib/frappe";
-import { getSession } from "@/lib/session";
+import { clearSessionCookie, getSession } from "@/lib/session";
 
 export async function GET() {
   const session = await getSession();
   if (!session) {
+    // Cookie present but invalid (old SESSION_SECRET, expired, edited): wipe
+    // it, or middleware keeps bouncing /login back to /portal.
+    await clearSessionCookie();
     return Response.json({ message: "Not signed in." }, { status: 401 });
   }
 
@@ -37,6 +40,9 @@ export async function GET() {
 export async function POST(request) {
   const session = await getSession();
   if (!session) {
+    // Cookie present but invalid (old SESSION_SECRET, expired, edited): wipe
+    // it, or middleware keeps bouncing /login back to /portal.
+    await clearSessionCookie();
     return Response.json({ message: "Not signed in." }, { status: 401 });
   }
 

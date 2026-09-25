@@ -5,6 +5,7 @@
 
 import React, { useState, useCallback } from "react";
 import MapPicker from './MapPicker';
+import { withBase } from "@/lib/paths";
 
 
 /**
@@ -358,7 +359,7 @@ export default function MemberProfileForm({
 
   async function saveMember() {
     const fd = buildFormData();
-    const res = await fetch(apiEndpoint, {
+    const res = await fetch(withBase(apiEndpoint), {
       method: "POST",
       headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
       body: fd,

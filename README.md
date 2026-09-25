@@ -58,6 +58,20 @@ npm run build
 pm2 start npm --name ayc -- start   # serves on :3000; put nginx + HTTPS in front
 ```
 
+### Serving under `/aycapp`
+
+Prod runs at `https://<domain>/aycapp`, dev at `http://localhost:3000/`. Set `NEXT_PUBLIC_BASE_PATH=/aycapp` in the server's `.env.production.local` (leave it unset locally) and rebuild — it feeds `basePath` in `next.config.mjs`. In code, wrap raw `fetch("/api/...")` URLs and plain asset paths with `withBase()` from `lib/paths.js`; `<Link>`, `router` and `redirect()` are prefixed by Next automatically.
+
+nginx:
+
+```nginx
+location /aycapp {
+    proxy_pass http://127.0.0.1:3000;   # no trailing slash — keeps the /aycapp prefix
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
 Updating: `git pull && npm ci && npm run build && pm2 restart ayc`.
 Changed an env value? Edit `.env.production.local` on the server, then rebuild if a `NEXT_PUBLIC_*` value changed, otherwise just `pm2 restart ayc`.
 

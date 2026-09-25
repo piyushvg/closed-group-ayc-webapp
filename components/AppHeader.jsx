@@ -10,12 +10,13 @@
 
 import Image from "next/image";
 import { useRouter } from "next/navigation";
+import { withBase } from "@/lib/paths";
 
 export default function AppHeader({ mobileNo = "" }) {
   const router = useRouter();
 
   async function signOut() {
-    await fetch("/api/auth/logout", { method: "POST" });
+    await fetch(withBase("/api/auth/logout"), { method: "POST" });
     router.replace("/login");
     router.refresh();
   }
@@ -26,7 +27,7 @@ export default function AppHeader({ mobileNo = "" }) {
 
       <div className="ayc-header-inner">
         <div className="ayc-brand">
-          <Image src="/ayc-logo.png" alt="AYC" width={40} height={40} priority />
+          <Image src={withBase("/ayc-logo.png")} alt="AYC" width={40} height={40} priority />
           <span className="ayc-brand-name">AYC</span>
         </div>
 

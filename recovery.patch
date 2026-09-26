@@ -1,0 +1,3353 @@
+diff --git a/app/api/auth/session/route.js b/app/api/auth/session/route.js
+new file mode 100644
+index 0000000..a2a560e
+--- /dev/null
++++ b/app/api/auth/session/route.js
+@@ -0,0 +1,22 @@
++// app/api/auth/session/route.js
++//
++// Lets a client component ask who it is talking to. The cookie itself is
++// httpOnly and signed, so the browser cannot read it — this route reads it
++// server-side and returns only the harmless parts.
++
++import { getSession } from "@/lib/session";
++
++export async function GET() {
++  const session = await getSession();
++
++  if (!session) {
++    return Response.json({ signedIn: false }, { status: 200 });
++  }
++
++  return Response.json({
++    signedIn: true,
++    memberId: session.memberId,
++    mobileNo: session.mobileNo ?? "",
++    isBoardMember: Boolean(session.isBoardMember),
++  });
++}
+\ No newline at end of file
+diff --git a/app/api/auth/verify/route.js b/app/api/auth/verify/route.js
+index 1a846c8..a49e373 100644
+--- a/app/api/auth/verify/route.js
++++ b/app/api/auth/verify/route.js
+@@ -5,9 +5,10 @@
+ // mobile app uses, and on success drops a signed httpOnly session cookie.
+ //
+ // The Firebase token is never stored — only the member identity Frappe
+-// hands back, which is all the rest of the site needs.
++// hands back, plus whether that member sits on the board, which is what
++// decides who may create events.
+ 
+-import { frappePost, FRAPPE_METHODS } from "@/lib/frappe";
++import { frappePost, isBoardMember, FRAPPE_METHODS } from "@/lib/frappe";
+ import { setSessionCookie } from "@/lib/session";
+ 
+ export async function POST(request) {
+@@ -35,16 +36,21 @@ export async function POST(request) {
+       );
+     }
+ 
++    // Looked up once, here, and carried in the signed cookie afterwards.
++    const boardMember = await isBoardMember(member.id);
++
+     await setSessionCookie({
+       memberId: member.id,
+       mobileNo: member.mobile_no,
+       memberRole: member.member_role,
++      isBoardMember: boardMember,
+     });
+ 
+     return Response.json({
+       memberId: member.id,
+       mobileNo: member.mobile_no,
+       memberRole: member.member_role,
++      isBoardMember: boardMember,
+     });
+   } catch (err) {
+     return Response.json(
+diff --git a/app/api/event/route.js b/app/api/event/route.js
+index 5d8ee3b..e40cd79 100644
+--- a/app/api/event/route.js
++++ b/app/api/event/route.js
+@@ -1,52 +1,74 @@
+-import { NextResponse } from "next/server";
++// app/api/event/route.js
++//
++// Creating an event is a board-member action. The check lives HERE, not just
++// in the UI — hiding the button only hides it; anyone can still POST to this
++// route directly. Both layers exist, and this is the one that matters.
+ 
+-const FRAPPE_BASE_URL = process.env.FRAPPE_BASE_URL;
+-const FRAPPE_API_KEY = process.env.FRAPPE_API_KEY;
+-const FRAPPE_API_SECRET = process.env.FRAPPE_API_SECRET;
+-
+-const CREATE_EVENT_PATH =
+-  "/api/method/community_circle_app.community_circle.api.event_api.create_event";
++import { frappePost, FRAPPE_METHODS } from "@/lib/frappe";
++import { getSession } from "@/lib/session";
+ 
+ export async function POST(request) {
++  const session = await getSession();
++
++  if (!session) {
++    return Response.json({ message: "Please sign in first." }, { status: 401 });
++  }
++
++  if (!session.isBoardMember) {
++    return Response.json(
++      { message: "Only board members can create events." },
++      { status: 403 }
++    );
++  }
++
+   try {
+     const body = await request.json();
+ 
+-    const response = await fetch(
+-      `${FRAPPE_BASE_URL}${CREATE_EVENT_PATH}`,
+-      {
+-        method: "POST",
+-        headers: {
+-          "Content-Type": "application/json",
+-          Authorization: `token ${FRAPPE_API_KEY}:${FRAPPE_API_SECRET}`,
+-        },
+-        body: JSON.stringify(body),
+-      }
+-    );
++    const eventName = String(body.event_name ?? "").trim();
++    const eventDatetime = String(body.event_datetime ?? "").trim();
++    const venue = String(body.venue ?? "").trim();
+ 
+-    const data = await response.json();
+-
+-    if (!response.ok) {
+-      return NextResponse.json(
+-        {
+-          error:
+-            data?.exception ||
+-            data?.message ||
+-            "Failed to create event",
+-          details: data,
+-        },
+-        { status: response.status }
++    if (!eventName || !eventDatetime || !venue) {
++      return Response.json(
++        { message: "Event name, date & time, and venue are required." },
++        { status: 400 }
+       );
+     }
+ 
+-    return NextResponse.json(data);
+-  } catch (error) {
+-    console.error("Create event error:", error);
++    const payload = {
++      event_name: eventName,
++      description: String(body.description ?? ""),
++      // The browser's datetime-local gives "2026-12-15T18:00"; Frappe wants
++      // a space and seconds.
++      event_datetime: normalizeDatetime(eventDatetime),
++      venue,
++      organizers: String(body.organizers ?? ""),
++      google_map_location: String(body.google_map_location ?? ""),
++    };
++
++    // Coordinates are optional — an event with no pin still saves.
++    const lat = Number(body.latitude);
++    const lng = Number(body.longitude);
++    if (body.latitude != null && body.longitude != null && !isNaN(lat) && !isNaN(lng)) {
++      payload.latitude = lat;
++      payload.longitude = lng;
++    }
++
++    // Useful for the backend to know who filed it; harmless if ignored.
++    payload.created_by_member = session.memberId;
+ 
+-    return NextResponse.json(
+-      {
+-        error: error.message || "Internal server error",
+-      },
++    const result = await frappePost(FRAPPE_METHODS.createEvent, payload);
++    return Response.json(result ?? { ok: true });
++  } catch (err) {
++    return Response.json(
++      { message: err.message || "Could not create the event." },
+       { status: 500 }
+     );
+   }
++}
++
++/** "2026-12-15T18:00" → "2026-12-15 18:00:00" */
++function normalizeDatetime(value) {
++  const withSpace = value.replace("T", " ");
++  return withSpace.length === 16 ? `${withSpace}:00` : withSpace;
+ }
+\ No newline at end of file
+diff --git a/app/api/member/me/route.js b/app/api/member/me/route.js
+index 991a6c5..752d16e 100644
+--- a/app/api/member/me/route.js
++++ b/app/api/member/me/route.js
+@@ -5,11 +5,23 @@
+ //
+ // The member id comes from the signed session cookie, never from the
+ // request body — otherwise anyone could read or overwrite another member's
+-// profile just by changing an id in devtools.
++// profile just by changing an id in devtools. The spouse's and children's
++// ids DO come from the body, but only after being matched against the ids
++// this member is actually linked to.
+ 
+ import { frappePost, FRAPPE_METHODS } from "@/lib/frappe";
+ import { clearSessionCookie, getSession } from "@/lib/session";
+ 
++// Prints every payload to the terminal before it is sent. Frappe's errors
++// ("Value missing for Businesses: Business Name") name a field but not which
++// of the several calls produced it, so seeing the exact body is the only way
++// to tell the member's own save apart from the spouse's.
++const DEBUG = process.env.NODE_ENV !== "production";
++
++function logPayload(label, payload) {
++  if (DEBUG) console.log(`[member/me] ${label}:`, JSON.stringify(payload, null, 2));
++}
++
+ export async function GET() {
+   const session = await getSession();
+   if (!session) {
+@@ -46,14 +58,86 @@ export async function POST(request) {
+     return Response.json({ message: "Not signed in." }, { status: 401 });
+   }
+ 
++  // Tracks which call is in flight, so a Frappe error can say whose record
++  // it came from instead of leaving everyone guessing.
++  let step = "profile";
++
+   try {
+     const body = await request.json();
+-    const payload = mapFormToPayload(body, session.memberId);
+-    const result = await frappePost(FRAPPE_METHODS.updateMember, payload);
+-    return Response.json(result ?? { ok: true });
++
++    // Re-read the record so related ids can be verified rather than trusted.
++    const current = await frappePost(FRAPPE_METHODS.getMemberDetails, {
++      member_id: session.memberId,
++    });
++    const linkedIds = new Set(
++      (Array.isArray(current?.relatives) ? current.relatives : [])
++        .map((r) => r?.member_id)
++        .filter(Boolean)
++    );
++
++    const saved = [];
++    const skipped = [];
++
++    // --- 1. The member's own record -------------------------------------
++    step = "your profile";
++    const memberPayload = mapFormToPayload(body, session.memberId);
++    logPayload("member payload", memberPayload);
++    await frappePost(FRAPPE_METHODS.updateMember, memberPayload);
++    saved.push("profile");
++
++    // --- 2. The spouse ---------------------------------------------------
++    // The spouse is NOT a set of fields on this record — it is a separate
++    // member (MEM-000002 and the like) linked through `relatives` with
++    // relation_type "Spouse". Saving their details means calling the same
++    // endpoint again with THEIR member_id. Until this existed, everything
++    // typed into the wife's section was simply dropped on save.
++    const spouseId = body?.wife?.memberId;
++    if (body?.member?.isMarried && spouseId) {
++      if (linkedIds.has(spouseId)) {
++        step = "spouse details";
++        const spousePayload = mapRelativeToPayload(body.wife, spouseId);
++        logPayload("spouse payload", spousePayload);
++        await frappePost(FRAPPE_METHODS.updateMember, spousePayload);
++        saved.push("spouse");
++      } else {
++        skipped.push("spouse (not linked to this member)");
++      }
++    } else if (body?.member?.isMarried) {
++      // No spouse record exists yet — update_member can only edit people who
++      // already exist, so the office has to create the spouse first.
++      skipped.push("spouse (no linked record yet — ask the office to add them)");
++    }
++
++    // --- 3. Children -----------------------------------------------------
++    // Same story: each child is their own member record.
++    const children = Array.isArray(body?.children) ? body.children : [];
++    for (const child of children) {
++      if (!child?.name?.trim()) continue;
++
++      if (child.memberId && linkedIds.has(child.memberId)) {
++        step = `child ${child.name}`;
++        const childPayload = mapRelativeToPayload(child, child.memberId);
++        logPayload(`child payload (${child.name})`, childPayload);
++        await frappePost(FRAPPE_METHODS.updateMember, childPayload);
++        saved.push(`child ${child.name}`);
++      } else if (!child.memberId) {
++        skipped.push(`${child.name} (new children must be added by the office)`);
++      }
++    }
++
++    return Response.json({
++      ok: true,
++      saved,
++      skipped,
++      message: skipped.length
++        ? `Saved. Not saved: ${skipped.join("; ")}.`
++        : "Saved successfully.",
++    });
+   } catch (err) {
++    const detail = err.message || "Could not save your details.";
++    if (DEBUG) console.error(`[member/me] failed while saving ${step}:`, detail);
+     return Response.json(
+-      { message: err.message || "Could not save your details." },
++      { message: `While saving ${step}: ${detail}` },
+       { status: 500 }
+     );
+   }
+@@ -62,188 +146,287 @@ export async function POST(request) {
+ // ---------------------------------------------------------------------------
+ // Field mapping
+ //
+-// ⚠️ These names follow the pattern the rest of this backend uses and the
+-// mobile app's src/api/members.ts. Log one real get_member_details response
+-// (it comes back in `raw` above) and correct anything that doesn't line up —
+-// a wrong key here shows up as an empty field, not an error, so it's easy to
+-// miss.
++// These names come from a real get_member_details response, not from guesses.
++// Four things about that response drive the shape below:
++//
++//   1. The record is mostly FLAT, but `businesses` is an array, `relatives`
++//      is an array, and `spouse` is a nested copy of a whole member record.
++//   2. Coordinates are `residence_latitude` / `residence_longitude` and
++//      `business_latitude` / `business_longitude` — NOT latitude/longitude.
++//   3. Phone numbers come back as "+91-8788830969". The form strips them to
++//      ten digits for typing, and Frappe's Phone field refuses to save
++//      anything without a country code, so the prefix goes back on.
++//   4. Spouse and children are separate member records, reachable only by
++//      their own member_id.
+ // ---------------------------------------------------------------------------
+ 
+ function str(value) {
+   return value == null ? "" : String(value);
+ }
+ 
++/** "+91-8788830969" → "8788830969". Keeps the last ten digits. */
++function phone(value) {
++  const digits = str(value).replace(/\D/g, "");
++  return digits.length > 10 ? digits.slice(-10) : digits;
++}
++
++/**
++ * "8788830969" → "+91-8788830969".
++ *
++ * Frappe rejects a bare number with "Please select a country code for field
++ * mobile_no". Numbers that already carry a code are left alone.
++ */
++function withCountryCode(value) {
++  const raw = str(value).trim();
++  if (!raw) return "";
++  if (raw.startsWith("+")) return raw;
++  const digits = raw.replace(/\D/g, "");
++  if (!digits) return "";
++  return digits.length === 10 ? `+91-${digits}` : `+${digits}`;
++}
++
++/** The form's Profession dropdown only accepts these three values. */
++function professionFor(record) {
++  const raw = str(record.profession).trim();
++  if (/^housewife$/i.test(raw)) return "Housewife";
++  if (/^business$/i.test(raw)) return "Business";
++  if (/^service$/i.test(raw)) return "Service";
++  // Nothing usable stored, but the member clearly runs something.
++  if (Array.isArray(record.businesses) && record.businesses.length) return "Business";
++  return "";
++}
++
++/** One entry from a `businesses` array → the form's business block. */
++function mapBusiness(b = {}) {
++  return {
++    // Carried so a save updates this business instead of creating a fourth.
++    businessId: str(b.business_id),
++    name: str(b.business_name),
++    description: str(b.description),
++    address1: str(b.office_address),
++    address2: "",
++    area: str(b.office_area),
++    city: str(b.city),
++    pinCode: str(b.pincode),
++    natureOfBusiness: str(b.category),
++    subCategory: str(b.sub_category),
++    officePhone: phone(b.office_phone_no),
++    email: "",
++    website: str(b.website),
++    lat: str(b.business_latitude),
++    lng: str(b.business_longitude),
++  };
++}
++
+ /** Frappe's member record → the shape MemberProfileForm's initialValues wants. */
+ export function mapMemberToForm(m = {}) {
+-  const [ancestorPlace = "", ancestorState = ""] = str(m.ancestors)
+-    .split(",")
+-    .map((part) => part.trim());
++  const businesses = Array.isArray(m.businesses) ? m.businesses : [];
++  const spouse = m.spouse && typeof m.spouse === "object" ? m.spouse : null;
++  const spouseBusinesses = Array.isArray(spouse?.businesses) ? spouse.businesses : [];
+ 
+-  const isMarried = Boolean(m.wife_member_id || m.spouse_name || m.is_married);
++  // The relatives array mixes spouse and children; only the children belong
++  // in the form's repeater.
++  const relatives = Array.isArray(m.relatives) ? m.relatives : [];
++  const children = relatives.filter((r) =>
++    /^(son|daughter|child)$/i.test(str(r.relation_type))
++  );
++
++  const isMarried = Boolean(spouse?.member_id);
+ 
+   return {
+     member: {
+-      name: str(m.full_name || m.member_name),
+-      husbandFatherName: str(m.husband_father_name || m.father_name),
++      name: str(m.full_name),
++      husbandFatherName: str(m.fathers_full_name),
+       surname: str(m.surname),
+       dob: str(m.dob),
+       education: str(m.education),
+-      mobile: str(m.mobile_no || m.mobile),
+-      altMobile: str(m.alternate_mobile_no),
+-      isInBoard: Boolean(m.is_board_member || m.is_in_board),
+-      boardDesignation: str(m.board_designation),
++      mobile: phone(m.mobile_no),
++      altMobile: phone(m.alternate_mobile_no || m.alternate_contact_no),
++      // No board fields exist on this doctype yet.
++      isInBoard: false,
++      boardDesignation: "",
+       isMarried,
+-      profession: str(m.profession),
+-    },
+-    service: {
+-      company: str(m.company),
+-      sector: str(m.sector),
+-      designation: str(m.designation),
+-    },
+-    business: {
+-      name: str(m.business_name),
+-      description: str(m.business_description),
+-      address1: str(m.office_address || m.home_address),
+-      address2: str(m.office_address_2),
+-      area: str(m.area_location),
+-      city: str(m.city),
+-      pinCode: str(m.pincode),
+-      natureOfBusiness: str(m.nature_of_business),
+-      officePhone: str(m.office_phone_no),
+-      email: str(m.email),
+-      website: str(m.website),
+-      lat: str(m.latitude),
+-      lng: str(m.longitude),
++      profession: professionFor(m),
+     },
++
++    // The backend has no company/sector/designation fields, so Service stays
++    // empty until they are added. Left in place so the form still renders.
++    service: { company: "", sector: "", designation: "" },
++
++    business: mapBusiness(businesses[0]),
++
+     ancestry: {
+-      place: str(m.ancestors_place || ancestorPlace),
+-      state: str(m.ancestors_state || ancestorState),
++      place: str(m.ancestors_place),
++      state: str(m.ancestors_state),
+       gotra: str(m.gotra),
+     },
++
+     wife: isMarried
+       ? {
+-          name: str(m.spouse_name),
+-          fatherName: str(m.spouse_father_name),
+-          profession: str(m.spouse_profession),
+-          mobile: str(m.spouse_mobile_no),
+-          altContact: str(m.spouse_alt_contact),
+-          dob: str(m.spouse_dob),
+-          education: str(m.spouse_education),
+-          anniversary: str(m.anniversary),
++          // Needed on save — the spouse is updated through their own record.
++          memberId: str(spouse.member_id),
++          name: str(spouse.full_name),
++          fatherName: str(spouse.fathers_full_name),
++          profession: spouseBusinesses.length ? "other" : "",
++          mobile: phone(spouse.mobile_no),
++          altContact: phone(spouse.alternate_mobile_no || spouse.alternate_contact_no),
++          dob: str(spouse.dob),
++          education: str(spouse.education),
++          anniversary: str(m.anniversary || spouse.anniversary),
+           residence: {
+-            // Nothing is pre-ticked here: the copy-from-husband checkbox
+-            // would overwrite a saved spouse address the moment the form
+-            // mounts.
++            // Never pre-ticked: the copy-from-husband checkbox would wipe a
++            // saved spouse address the moment the form mounts.
+             sameAsHusband: false,
+-            address: str(m.spouse_home_address),
+-            area: str(m.spouse_area),
+-            city: str(m.spouse_city),
+-            pinCode: str(m.spouse_pincode),
+-            lat: str(m.spouse_latitude),
+-            lng: str(m.spouse_longitude),
++            address: str(spouse.home_address),
++            area: str(spouse.area_location),
++            city: str(spouse.city),
++            pinCode: str(spouse.pincode),
++            lat: str(spouse.residence_latitude),
++            lng: str(spouse.residence_longitude),
+           },
++          business: spouseBusinesses.length
++            ? { ...mapBusiness(spouseBusinesses[0]), sameAsHusband: false }
++            : undefined,
+         }
+       : undefined,
+-    children: Array.isArray(m.children) && m.children.length
+-      ? m.children.map((c) => ({
+-          name: str(c.name || c.child_name),
++
++    children: children.length
++      ? children.map((c) => ({
++          memberId: str(c.member_id),
++          name: str(c.full_name),
+           dob: str(c.dob),
+           education: str(c.education),
+-          mobile: str(c.mobile_no || c.mobile),
++          mobile: phone(c.mobile_no),
+           additionalInfo: str(c.additional_info),
+         }))
+       : undefined,
++
++    // Home address and its pin live on the member record itself, separate
++    // from any business address.
++    residence: {
++      address: str(m.home_address),
++      area: str(m.area_location),
++      city: str(m.city),
++      pinCode: str(m.pincode),
++      lat: str(m.residence_latitude),
++      lng: str(m.residence_longitude),
++    },
++
+     photos: {
+-      member: str(m.photo),
+-      spouse: str(m.spouse_photo),
+-      couple: str(m.couple_photo),
++      member: str(m.photo_url),
++      spouse: str(spouse?.photo_url),
++      couple: "",
+     },
+   };
+ }
+ 
+-/** The form's JSON → the flat payload the update method expects. */
++/** Drops keys Frappe would read as "clear this field". */
++function prune(payload, memberId) {
++  Object.keys(payload).forEach((key) => {
++    if (payload[key] === undefined || payload[key] === null || payload[key] === "") {
++      delete payload[key];
++    }
++  });
++  payload.member_id = memberId;
++  return payload;
++}
++
++/**
++ * Business fields, or nothing at all.
++ *
++ * Frappe answers a half-filled business with "Value missing for Businesses:
++ * Business Name" — including when only, say, a category or a phone number
++ * reaches it, because that is enough for it to start building a business row
++ * that has no name. So either the name goes with the rest, or none of it is
++ * sent.
++ */
++function businessFields(business = {}) {
++  const name = str(business.name).trim();
++  if (!name) return null;
++
++  return {
++    business_id: business.businessId,
++    business_name: name,
++    description: business.description,
++    category: business.natureOfBusiness,
++    sub_category: business.subCategory,
++    office_phone_no: withCountryCode(business.officePhone),
++    website: business.website,
++    office_address: business.address1,
++    office_area: business.area,
++    business_latitude: business.lat,
++    business_longitude: business.lng,
++  };
++}
++
++/** The form's JSON → the flat payload update_member expects. */
+ function mapFormToPayload(form = {}, memberId) {
+   const member = form.member ?? {};
+-  const business = form.business ?? {};
+-  const service = form.service ?? {};
+   const ancestry = form.ancestry ?? {};
+-  const wife = form.wife ?? null;
+-  const children = Array.isArray(form.children) ? form.children : [];
++  const residence = form.residence ?? {};
+ 
+   const payload = {
+-    member_id: memberId,
+-
+     full_name: member.name,
+-    husband_father_name: member.husbandFatherName,
++    fathers_full_name: member.husbandFatherName,
+     surname: member.surname,
+     dob: member.dob,
+     education: member.education,
+-    mobile_no: member.mobile,
+-    alternate_mobile_no: member.altMobile,
+-    is_board_member: member.isInBoard ? 1 : 0,
+-    board_designation: member.isInBoard ? member.boardDesignation : "",
+-    is_married: member.isMarried ? 1 : 0,
+     profession: member.profession,
++    mobile_no: withCountryCode(member.mobile),
++    alternate_mobile_no: withCountryCode(member.altMobile),
++    anniversary: form.wife?.anniversary,
+ 
++    gotra: ancestry.gotra,
+     ancestors_place: ancestry.place,
+     ancestors_state: ancestry.state,
+-    gotra: ancestry.gotra,
++
++    home_address: residence.address,
++    area_location: residence.area,
++    city: residence.city,
++    pincode: residence.pinCode,
++    residence_latitude: residence.lat,
++    residence_longitude: residence.lng,
+   };
+ 
++  // Business — the same endpoint doubles as add/update business. Sending the
++  // business_id is what makes it an update; without it a second save would
++  // file a brand-new business every time.
+   if (member.profession === "Business") {
+-    Object.assign(payload, {
+-      business_name: business.name,
+-      business_description: business.description,
+-      office_address: business.address1,
+-      office_address_2: business.address2,
+-      area_location: business.area,
+-      city: business.city,
+-      pincode: business.pinCode,
+-      nature_of_business: business.natureOfBusiness,
+-      office_phone_no: business.officePhone,
+-      email: business.email,
+-      website: business.website,
+-      latitude: business.lat,
+-      longitude: business.lng,
+-    });
++    const biz = businessFields(form.business);
++    if (biz) Object.assign(payload, biz);
+   }
+ 
+-  if (member.profession === "Service") {
+-    Object.assign(payload, {
+-      company: service.company,
+-      sector: service.sector,
+-      designation: service.designation,
+-    });
+-  }
++  return prune(payload, memberId);
++}
+ 
+-  if (member.isMarried && wife) {
+-    Object.assign(payload, {
+-      spouse_name: wife.name,
+-      spouse_father_name: wife.fatherName,
+-      spouse_profession: wife.profession,
+-      spouse_mobile_no: wife.mobile,
+-      spouse_alt_contact: wife.altContact,
+-      spouse_dob: wife.dob,
+-      spouse_education: wife.education,
+-      anniversary: wife.anniversary,
+-      spouse_home_address: wife.residence?.address,
+-      spouse_area: wife.residence?.area,
+-      spouse_city: wife.residence?.city,
+-      spouse_pincode: wife.residence?.pinCode,
+-      spouse_latitude: wife.residence?.lat,
+-      spouse_longitude: wife.residence?.lng,
+-    });
++/**
++ * The wife or a child block → a payload for THAT person's own member record.
++ * Both are relatives, both are edited the same way.
++ */
++function mapRelativeToPayload(person = {}, personId) {
++  const residence = person.residence ?? {};
+ 
+-    const realChildren = children.filter((c) => c?.name?.trim());
+-    if (realChildren.length) payload.children = JSON.stringify(realChildren);
+-  }
++  const payload = {
++    full_name: person.name,
++    fathers_full_name: person.fatherName,
++    dob: person.dob,
++    education: person.education,
++    anniversary: person.anniversary,
++    additional_info: person.additionalInfo,
++    mobile_no: withCountryCode(person.mobile),
++    alternate_mobile_no: withCountryCode(person.altContact),
+ 
+-  // Frappe treats an explicit null as "clear this field", so undefined keys
+-  // are dropped rather than sent — a field the form didn't touch keeps
+-  // whatever is already saved.
+-  Object.keys(payload).forEach((key) => {
+-    if (payload[key] === undefined) delete payload[key];
+-  });
++    home_address: residence.address,
++    area_location: residence.area,
++    city: residence.city,
++    pincode: residence.pinCode,
++    residence_latitude: residence.lat,
++    residence_longitude: residence.lng,
++  };
+ 
+-  return payload;
++  // The spouse can carry a business of their own, on their own record.
++  const biz = businessFields(person.business);
++  if (biz) Object.assign(payload, biz);
++
++  return prune(payload, personId);
+ }
+\ No newline at end of file
+diff --git a/app/create-event/page.jsx b/app/create-event/page.jsx
+index f1d9e98..453d165 100644
+--- a/app/create-event/page.jsx
++++ b/app/create-event/page.jsx
+@@ -1,7 +1,62 @@
+-"use client";
++// app/create-event/page.js
++//
++// Server component: the board check happens before anything renders, so a
++// non-board member never even sees the form skeleton. The API route checks
++// again on submit — see app/api/event/route.js.
+ 
+-import CreateEventForm from "../../components/CreateEventForm";
++import { redirect } from "next/navigation";
++import { getSession } from "@/lib/session";
++import AppHeader from "@/components/AppHeader";
++import CreateEventForm from "@/components/CreateEventForm";
+ 
+-export default function CreateEventPage() {
+-  return <CreateEventForm />;
+-}
+\ No newline at end of file
++export default async function CreateEventPage() {
++  const session = await getSession();
++
++  if (!session) redirect("/login");
++
++  if (!session.isBoardMember) {
++    return (
++      <div style={styles.outer}>
++        <AppHeader mobileNo={session.mobileNo} />
++        <div style={styles.box}>
++          <h1 style={styles.title}>Board members only</h1>
++          <p style={styles.text}>
++            Events are created by the board. If you think you should have access,
++            please contact the club office.
++          </p>
++          <a href="/portal" style={styles.link}>
++            Back to my profile
++          </a>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div style={styles.outer}>
++      <AppHeader mobileNo={session.mobileNo} />
++      <CreateEventForm />
++    </div>
++  );
++}
++
++const styles = {
++  outer: {
++    minHeight: "100vh",
++    background: "#FAF9F5",
++    color: "#2B2A27",
++    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif',
++  },
++  box: {
++    maxWidth: 520,
++    margin: "80px auto",
++    padding: "28px 26px",
++    background: "#FFFFFF",
++    border: "1px solid #D8D5CB",
++    borderRadius: 12,
++    textAlign: "center",
++  },
++  title: { fontSize: 19, fontWeight: 600, margin: "0 0 8px" },
++  text: { fontSize: 13.5, color: "#7A776E", margin: "0 0 18px", lineHeight: 1.5 },
++  link: { fontSize: 13.5, color: "#B3413A", fontWeight: 600, textDecoration: "none" },
++};
+\ No newline at end of file
+diff --git a/components/AppHeader.jsx b/components/AppHeader.jsx
+index 261fbe1..e66418d 100644
+--- a/components/AppHeader.jsx
++++ b/components/AppHeader.jsx
+@@ -3,17 +3,42 @@
+ // components/AppHeader.jsx
+ //
+ // AYC logo sits on the left of every page. When a member is signed in it
+-// also carries their number and a sign-out button.
++// also carries their number, a sign-out button, and — for board members
++// only — the link to create an event.
+ //
+-// Drop the logo file at webapp/public/ayc-logo.png — the same asset the
+-// mobile app shows in its home header.
++// The link is hidden from everyone else, but hiding is not the protection:
++// app/api/event/route.js rejects non-board members regardless of what the
++// UI shows.
+ 
++import { useEffect, useState } from "react";
+ import Image from "next/image";
++<<<<<<< HEAD
+ import { useRouter } from "next/navigation";
+ import { withBase } from "@/lib/paths";
++=======
++import Link from "next/link";
++import { usePathname, useRouter } from "next/navigation";
++>>>>>>> fonts_bugs_clear
+ 
+ export default function AppHeader({ mobileNo = "" }) {
+   const router = useRouter();
++  const pathname = usePathname();
++  const [isBoardMember, setIsBoardMember] = useState(false);
++
++  // The session cookie is httpOnly, so the browser can't read it directly —
++  // this asks the server who it is talking to.
++  useEffect(() => {
++    let cancelled = false;
++    fetch("/api/auth/session")
++      .then((r) => r.json())
++      .then((d) => {
++        if (!cancelled) setIsBoardMember(Boolean(d?.isBoardMember));
++      })
++      .catch(() => {});
++    return () => {
++      cancelled = true;
++    };
++  }, []);
+ 
+   async function signOut() {
+     await fetch(withBase("/api/auth/logout"), { method: "POST" });
+@@ -33,6 +58,16 @@ export default function AppHeader({ mobileNo = "" }) {
+ 
+         {mobileNo ? (
+           <div className="ayc-header-right">
++            {isBoardMember && pathname !== "/create-event" && (
++              <Link href="/create-event" className="ayc-action">
++                Create event
++              </Link>
++            )}
++            {pathname !== "/portal" && (
++              <Link href="/portal" className="ayc-action">
++                My profile
++              </Link>
++            )}
+             <span className="ayc-header-user">+91 {mobileNo}</span>
+             <button type="button" className="ayc-signout" onClick={signOut}>
+               Sign out
+@@ -63,13 +98,19 @@ const css = `
+   .ayc-brand-name { font-size: 15px; font-weight: 700; color: #2B2A27; letter-spacing: 0.04em; }
+   .ayc-header-right { display: flex; align-items: center; gap: 12px; }
+   .ayc-header-user { font-size: 12.5px; color: #7A776E; }
++  .ayc-action {
++    font-size: 12.5px; font-weight: 600; color: #B3413A; text-decoration: none;
++    white-space: nowrap;
++  }
++  .ayc-action:hover { text-decoration: underline; }
+   .ayc-signout {
+     height: 32px; padding: 0 12px; border-radius: 6px;
+     border: 1px solid #B9B6AC; background: #FFFFFF;
+     font-size: 12.5px; color: #2B2A27; cursor: pointer;
+   }
+ 
+-  @media (max-width: 480px) {
++  @media (max-width: 560px) {
+     .ayc-header-user { display: none; }
++    .ayc-header-right { gap: 10px; }
+   }
+ `;
+\ No newline at end of file
+diff --git a/components/CreateEventForm.jsx b/components/CreateEventForm.jsx
+index 68c3b4d..63ae2f0 100644
+--- a/components/CreateEventForm.jsx
++++ b/components/CreateEventForm.jsx
+@@ -3,24 +3,26 @@
+ // (navigator.geolocation).
+ 
+ import React, { useState } from "react";
++<<<<<<< HEAD
+ import MapPicker from './MapPicker';
+ import { withBase } from "@/lib/paths";
++=======
++import MapPicker from "./MapPicker";
++>>>>>>> fonts_bugs_clear
+ 
+ /**
+  * CreateEventForm
+  * ----------------
+  * Styled to match MemberProfileForm.jsx (same card look, same
+- * required-field red-highlight behaviour, same "Use current location"
+- * pattern for lat/lng — plus a MapPicker so organizers can drop/drag a pin
+- * instead of typing lat/lng by hand).
++ * required-field red-highlight behaviour).
+  *
+- * Wired to POST /api/event, which is a Next.js API route that forwards to
+- * the real Frappe endpoint:
+- *   community_circle_app.community_circle.api.event_api.create_event
+- * (confirmed working in the team's Postman collection).
++ * Location works the same way as it does on a member's profile: the pin is
++ * the interface, and the coordinates are never shown. Organizers see
++ * "Location set" or "No location set yet"; the numbers travel to the backend
++ * with the rest of the payload.
+  *
+- * USAGE:
+- *   <CreateEventForm apiEndpoint="/api/event" onSaved={(res) => ...} />
++ * Posts to /api/event, which verifies board membership server-side before
++ * forwarding to Frappe's event_api.create_event.
+  */
+ 
+ const emptyForm = () => ({
+@@ -34,11 +36,7 @@ const emptyForm = () => ({
+   longitude: "",
+ });
+ 
+-export default function CreateEventForm({
+-  apiEndpoint = "/api/event",
+-  authToken,
+-  onSaved,
+-}) {
++export default function CreateEventForm({ apiEndpoint = "/api/event", onSaved }) {
+   const [form, setForm] = useState(emptyForm());
+   const [errors, setErrors] = useState({});
+   const [saving, setSaving] = useState(false);
+@@ -47,8 +45,13 @@ export default function CreateEventForm({
+   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
+   const errFor = (key) => errors[key] || "";
+ 
++  const hasLocation = Boolean(form.latitude && form.longitude);
++
+   const captureLocation = () => {
+-    if (!navigator.geolocation) return;
++    if (!navigator.geolocation) {
++      setBanner({ type: "error", text: "Geolocation is not supported in this browser." });
++      return;
++    }
+     navigator.geolocation.getCurrentPosition(
+       (pos) => {
+         set({
+@@ -60,6 +63,8 @@ export default function CreateEventForm({
+         setBanner({ type: "error", text: "Couldn't read your location — check browser permission." });
+       },
+       {
++        // Without this the browser takes the fast path and resolves location
++        // from Wi-Fi or IP data, which on a laptop can be kilometres out.
+         enableHighAccuracy: true,
+         timeout: 15000,
+         maximumAge: 0,
+@@ -92,20 +97,16 @@ export default function CreateEventForm({
+     try {
+       const res = await fetch(withBase(apiEndpoint), {
+         method: "POST",
+-        headers: {
+-          "Content-Type": "application/json",
+-          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+-        },
++        headers: { "Content-Type": "application/json" },
+         body: JSON.stringify({
+           event_name: form.event_name,
+           description: form.description,
+-          // datetime-local gives "2026-12-15T18:00" — Frappe wants a space.
+-          event_datetime: form.event_datetime.replace("T", " "),
++          event_datetime: form.event_datetime,
+           venue: form.venue,
+           google_map_location: form.google_map_location,
+           organizers: form.organizers,
+-          latitude: form.latitude ? Number(form.latitude) : null,
+-          longitude: form.longitude ? Number(form.longitude) : null,
++          latitude: form.latitude || null,
++          longitude: form.longitude || null,
+         }),
+       });
+ 
+@@ -135,117 +136,110 @@ export default function CreateEventForm({
+   return (
+     <div className="cef-outer">
+       <div className="cef-page">
+-      <style>{CSS}</style>
+-
+-      <header className="cef-head">
+-        <h1>Create event</h1>
+-        <p>Add a new community event with date, venue and location.</p>
+-        <div className="cef-legend"><span className="cef-req">*</span> indicates a mandatory field</div>
+-      </header>
+-
+-      {banner && (
+-        <div className={`cef-banner cef-banner-${banner.type}`}>{banner.text}</div>
+-      )}
+-
+-      <form onSubmit={handleSubmit}>
+-        <section className="cef-card">
+-          <div className="cef-grid">
+-            <Field label="Event name" required full error={errFor("event_name")}>
+-              <input
+-                type="text"
+-                value={form.event_name}
+-                onChange={(e) => set({ event_name: e.target.value })}
+-              />
+-            </Field>
+-
+-            <Field label="Description" full>
+-              <textarea
+-                rows={3}
+-                value={form.description}
+-                onChange={(e) => set({ description: e.target.value })}
+-              />
+-            </Field>
+-
+-            <Field label="Date & time" required error={errFor("event_datetime")}>
+-              <input
+-                type="datetime-local"
+-                value={form.event_datetime}
+-                onChange={(e) => set({ event_datetime: e.target.value })}
+-              />
+-            </Field>
+-
+-            <Field label="Venue" required error={errFor("venue")}>
+-              <input
+-                type="text"
+-                value={form.venue}
+-                onChange={(e) => set({ venue: e.target.value })}
+-              />
+-            </Field>
+-
+-            <Field label="Organizers" full>
+-              <input
+-                type="text"
+-                value={form.organizers}
+-                onChange={(e) => set({ organizers: e.target.value })}
+-              />
+-            </Field>
+-
+-            <Field label="Google Maps link" full>
+-              <input
+-                type="url"
+-                placeholder="https://maps.google.com/?q=..."
+-                value={form.google_map_location}
+-                onChange={(e) => set({ google_map_location: e.target.value })}
+-              />
+-            </Field>
+-
+-            {/* Map picker — was accidentally left floating inside the
+-                function body earlier, referencing an undefined
+-                `event`/`setEvent`. Fixed: lives here in the render JSX,
+-                wired to this component's actual `form`/`set` state. */}
+-            <div className="cef-field-full">
+-              <MapPicker
+-                initialLat={form.latitude}
+-                initialLng={form.longitude}
+-                onLocationSelect={(lat, lng) =>
+-                  set({ latitude: String(lat), longitude: String(lng) })
+-                }
+-              />
+-            </div>
++        <style>{CSS}</style>
+ 
+-            <div className="cef-geo-row">
+-              <Field label="Latitude">
++        <header className="cef-head">
++          <h1>Create event</h1>
++          <p>Add a new community event with date, venue and location.</p>
++          <div className="cef-legend"><span className="cef-req">*</span> indicates a mandatory field</div>
++        </header>
++
++        {banner && <div className={`cef-banner cef-banner-${banner.type}`}>{banner.text}</div>}
++
++        <form onSubmit={handleSubmit}>
++          <section className="cef-card">
++            <div className="cef-grid">
++              <Field label="Event name" required full error={errFor("event_name")}>
+                 <input
+                   type="text"
+-                  placeholder="e.g. 18.5204"
+-                  value={form.latitude}
+-                  onChange={(e) => set({ latitude: e.target.value })}
++                  value={form.event_name}
++                  onChange={(e) => set({ event_name: e.target.value })}
++                />
++              </Field>
++
++              <Field label="Description" full>
++                <textarea
++                  rows={3}
++                  value={form.description}
++                  onChange={(e) => set({ description: e.target.value })}
++                />
++              </Field>
++
++              <Field label="Date & time" required error={errFor("event_datetime")}>
++                <input
++                  type="datetime-local"
++                  value={form.event_datetime}
++                  onChange={(e) => set({ event_datetime: e.target.value })}
+                 />
+               </Field>
+-              <Field label="Longitude">
++
++              <Field label="Venue" required error={errFor("venue")}>
+                 <input
+                   type="text"
+-                  placeholder="e.g. 73.8567"
+-                  value={form.longitude}
+-                  onChange={(e) => set({ longitude: e.target.value })}
++                  value={form.venue}
++                  onChange={(e) => set({ venue: e.target.value })}
+                 />
+               </Field>
+-              <button type="button" className="cef-geo-btn" onClick={captureLocation}>
+-                📍 Use current location
+-              </button>
++
++              <Field label="Organizers" full>
++                <input
++                  type="text"
++                  value={form.organizers}
++                  onChange={(e) => set({ organizers: e.target.value })}
++                />
++              </Field>
++
++              <Field label="Google Maps link" full>
++                <input
++                  type="url"
++                  placeholder="https://maps.google.com/?q=..."
++                  value={form.google_map_location}
++                  onChange={(e) => set({ google_map_location: e.target.value })}
++                />
++              </Field>
++
++              <div className="cef-field-full">
++                <label className="cef-map-label">Event location</label>
++                <MapPicker
++                  initialLat={form.latitude}
++                  initialLng={form.longitude}
++                  onLocationSelect={(lat, lng) =>
++                    set({ latitude: String(lat), longitude: String(lng) })
++                  }
++                />
++              </div>
++
++              {/* Deliberately no latitude/longitude boxes. Organizers pick the
++                  spot visually; the numbers live in state and travel with the
++                  save, exactly as they do on a member's profile. */}
++              <div className="cef-geo-row">
++                <div className="cef-geo-status">
++                  <span className={"cef-geo-dot" + (hasLocation ? " cef-geo-dot-set" : "")} aria-hidden="true" />
++                  <span className="cef-geo-status-text">
++                    {hasLocation ? "📍 Location set" : "No location set yet"}
++                  </span>
++                </div>
++                <button type="button" className="cef-geo-btn" onClick={captureLocation}>
++                  Use current location
++                </button>
++              </div>
++
++              <p className="cef-location-hint">
++                &quot;Use current location&quot; is approximate on laptops (no GPS chip) —
++                for an exact spot, click or drag the pin on the map above.
++              </p>
+             </div>
++          </section>
++
++          <div className="cef-actions">
++            <button type="button" className="cef-cancel" onClick={() => setForm(emptyForm())}>
++              Reset
++            </button>
++            <button type="submit" className="cef-save" disabled={saving}>
++              {saving ? "Saving…" : "Create event"}
++            </button>
+           </div>
+-        </section>
+-
+-        <div className="cef-actions">
+-          <button type="button" className="cef-cancel" onClick={() => setForm(emptyForm())}>
+-            Reset
+-          </button>
+-          <button type="submit" className="cef-save" disabled={saving}>
+-            {saving ? "Saving…" : "Create event"}
+-          </button>
+-        </div>
+-      </form>
++        </form>
+       </div>
+     </div>
+   );
+@@ -271,21 +265,15 @@ function Field({ label, required, full, error, children }) {
+ }
+ 
+ const CSS = `
+-  /* Full-width wrapper: carries the background edge-to-edge so there's no
+-     black/blank strip on either side on wide laptop screens. Content
+-     itself still sits in a max-width column below. */
+   .cef-outer {
+     --border: #B9B6AC; --border-light: #D8D5CB; --surface: #FAF9F5;
+     --card: #FFFFFF; --text: #2B2A27; --text-muted: #7A776E; --accent: #B3413A;
+     width: 100%;
+-    min-height: 100vh;
+     background: var(--surface);
+     color: var(--text);
+     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+   }
+-  .cef-page {
+-    max-width: 1100px; margin: 0 auto; padding: 32px 16px 80px;
+-  }
++  .cef-page { max-width: 1100px; margin: 0 auto; padding: 32px 16px 80px; }
+   .cef-head { margin-bottom: 20px; }
+   .cef-head h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+   .cef-head p { margin: 0; color: var(--text-muted); font-size: 13px; }
+@@ -300,7 +288,8 @@ const CSS = `
+   .cef-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px 16px; }
+   .cef-field { display: flex; flex-direction: column; gap: 4px; }
+   .cef-field-full { grid-column: 1 / -1; }
+-  .cef-field label { font-size: 12px; color: var(--text-muted); }
++  .cef-field label, .cef-map-label { font-size: 12px; color: var(--text-muted); }
++  .cef-map-label { display: block; margin-bottom: 6px; }
+   .cef-field input, .cef-field textarea {
+     border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+     font-size: 13px; background: var(--card); color: var(--text); width: 100%;
+@@ -313,12 +302,22 @@ const CSS = `
+     border-color: var(--accent) !important; border-width: 1.5px !important; background: #FDF3F2;
+   }
+ 
+-  .cef-geo-row { display: flex; align-items: flex-end; gap: 10px; grid-column: 1 / -1; }
+-  .cef-geo-row .cef-field { flex: 1; }
++  .cef-geo-row {
++    display: flex; align-items: center; justify-content: space-between;
++    gap: 10px; grid-column: 1 / -1; margin-top: 10px;
++  }
++  .cef-geo-status { display: flex; align-items: center; gap: 8px; }
++  .cef-geo-dot { width: 8px; height: 8px; border-radius: 4px; background: var(--border); flex-shrink: 0; }
++  .cef-geo-dot-set { background: #2E6B3E; }
++  .cef-geo-status-text { font-size: 12.5px; color: var(--text-muted); }
+   .cef-geo-btn {
+     height: 34px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border);
+     background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap;
+   }
++  .cef-location-hint {
++    grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted);
++    margin: 6px 0 0; font-style: italic;
++  }
+ 
+   .cef-actions { display: flex; justify-content: flex-end; gap: 10px; }
+   .cef-actions button { height: 38px; padding: 0 18px; border-radius: 6px; font-size: 13.5px; cursor: pointer; }
+@@ -326,8 +325,6 @@ const CSS = `
+   .cef-save { background: var(--text); border: none; color: #fff; font-weight: 600; }
+   .cef-save:disabled { opacity: 0.6; cursor: not-allowed; }
+ 
+-  /* Responsive: 4 columns is a laptop/desktop layout, stepping down as
+-     the viewport shrinks so fields never get squeezed unreadably narrow. */
+   @media (max-width: 900px) {
+     .cef-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
+   }
+diff --git a/components/MapPicker.jsx b/components/MapPicker.jsx
+index 4ac5967..fa6d2b5 100644
+--- a/components/MapPicker.jsx
++++ b/components/MapPicker.jsx
+@@ -11,8 +11,7 @@ import { useEffect, useId, useRef, useState } from "react";
+ // (geocoding/routing), and must never be shipped to the browser.
+ const MAPPLS_KEY = process.env.NEXT_PUBLIC_MAPPLS_ACCESS_TOKEN;
+ 
+-// Default centre: Nagpur (Ring Road / Sitabuldi / Itwari areas used
+-// elsewhere in the app). Change if the club is based elsewhere.
++// Default centre: Nagpur.
+ const DEFAULT_LAT = 21.1458;
+ const DEFAULT_LNG = 79.0882;
+ 
+@@ -45,21 +44,16 @@ function waitForContainer(id, attemptsLeft = 30) {
+  * Renders an interactive Mappls map. Click anywhere (or drag the marker)
+  * to set a location — calls onLocationSelect(lat, lng) every time it changes.
+  *
+- * Usage:
+- *   <MapPicker
+- *     initialLat={business.lat}
+- *     initialLng={business.lng}
+- *     onLocationSelect={(lat, lng) => {
+- *       setBusiness((b) => ({ ...b, lat, lng }));
+- *     }}
+- *   />
++ * The coordinates are never displayed by this component; whoever uses it
++ * decides what to show. Both the member profile and the event form show a
++ * status line rather than the numbers.
+  */
+ export default function MapPicker({ initialLat, initialLng, onLocationSelect }) {
+   const mapDivRef = useRef(null);
+   const mapRef = useRef(null);
+   const markerRef = useRef(null);
+   const [loaded, setLoaded] = useState(false);
+-  const [error, setError] = useState(false);
++  const [error, setError] = useState("");
+ 
+   // Mappls' Map() constructor wants the container's id *string*, not a DOM
+   // element reference — passing the element itself silently fails with
+@@ -69,51 +63,64 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect })
+   // context, so they're swapped for dashes.
+   const containerId = `mappls-map-${useId().replace(/:/g, "-")}`;
+ 
+-  const lat = initialLat ?? DEFAULT_LAT;
+-  const lng = initialLng ?? DEFAULT_LNG;
++  const lat = Number(initialLat) || DEFAULT_LAT;
++  const lng = Number(initialLng) || DEFAULT_LNG;
+ 
+   useEffect(() => {
+     let cancelled = false;
+ 
++    if (!MAPPLS_KEY) {
++      setError("NEXT_PUBLIC_MAPPLS_ACCESS_TOKEN is not set in .env.local");
++      return;
++    }
++
+     async function initMap() {
+       if (cancelled || !window.mappls) return;
+ 
+       try {
+         await waitForContainer(containerId);
+       } catch (e) {
+-        if (!cancelled) setError(true);
++        if (!cancelled) setError(e.message);
+         return;
+       }
+       if (cancelled) return;
+ 
+-      const map = new window.mappls.Map(containerId, {
+-        center: [lat, lng],
+-        zoom: 15,
+-      });
+-      mapRef.current = map;
+-
+-      map.on("load", () => {
+-        if (cancelled) return;
+-
+-        const marker = new window.mappls.Marker({
+-          map,
+-          position: { lat, lng },
+-          draggable: true,
+-        });
+-        markerRef.current = marker;
+-        setLoaded(true);
+-
+-        map.on("click", (e) => {
+-          const pos = { lat: e.lnglat.lat, lng: e.lnglat.lng };
+-          marker.setPosition(pos);
+-          onLocationSelect?.(pos.lat, pos.lng);
++      try {
++        const map = new window.mappls.Map(containerId, {
++          center: [lat, lng],
++          zoom: 15,
+         });
+-
+-        marker.addListener("dragend", () => {
+-          const pos = marker.getPosition();
+-          onLocationSelect?.(pos.lat, pos.lng);
++        mapRef.current = map;
++
++        map.on("load", () => {
++          if (cancelled) return;
++
++          const marker = new window.mappls.Marker({
++            map,
++            position: { lat, lng },
++            draggable: true,
++          });
++          markerRef.current = marker;
++          setLoaded(true);
++
++          map.on("click", (e) => {
++            // Different SDK builds spell this differently; a wrong guess
++            // here throws inside the handler and the pin simply never moves.
++            const ll = e.lngLat || e.lnglat || e.latlng;
++            if (!ll) return;
++            const pos = { lat: ll.lat, lng: ll.lng };
++            marker.setPosition(pos);
++            onLocationSelect?.(pos.lat, pos.lng);
++          });
++
++          marker.addListener("dragend", () => {
++            const pos = marker.getPosition();
++            onLocationSelect?.(pos.lat, pos.lng);
++          });
+         });
+-      });
++      } catch (e) {
++        if (!cancelled) setError(e?.message || "Mappls failed to initialise");
++      }
+     }
+ 
+     if (window.mappls) {
+@@ -128,7 +135,8 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect })
+         script.src = `https://apis.mappls.com/advancedmaps/api/${MAPPLS_KEY}/map_sdk?layer=vector&v=3.0`;
+         script.async = true;
+         script.onload = initMap;
+-        script.onerror = () => setError(true);
++        script.onerror = () =>
++          setError("Mappls SDK script failed to load — check the key and its domain restrictions.");
+         document.head.appendChild(script);
+       }
+     }
+@@ -152,11 +160,12 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect })
+       )}
+       {error && (
+         <div style={{
+-          position: "absolute", inset: 0, display: "flex",
++          position: "absolute", inset: 0, display: "flex", flexDirection: "column", gap: 6,
+           alignItems: "center", justifyContent: "center",
+           background: "#f5f3ef", color: "#d9534f", fontSize: 13, textAlign: "center", padding: 16,
+         }}>
+-          Could not load the map. Check the Mappls key.
++          <strong>Could not load the map.</strong>
++          <span style={{ fontSize: 11.5, color: "#8a8078" }}>{error}</span>
+         </div>
+       )}
+       <div ref={mapDivRef} id={containerId} style={{ width: "100%", height: "100%" }} />
+diff --git a/components/MemberProfileForm.jsx b/components/MemberProfileForm.jsx
+index 5c858f4..65ed5e8 100644
+--- a/components/MemberProfileForm.jsx
++++ b/components/MemberProfileForm.jsx
+@@ -3,37 +3,39 @@
+ // and browser-only APIs (navigator.geolocation), so it must render on the
+ // client, not the server.
+ 
++<<<<<<< HEAD
+ import React, { useState, useCallback } from "react";
+ import MapPicker from './MapPicker';
+ import { withBase } from "@/lib/paths";
+ 
++=======
++import React, { useState, useCallback, useEffect, useRef } from "react";
++import MapPicker from "./MapPicker";
++import { useRouter } from "next/navigation";
++>>>>>>> fonts_bugs_clear
+ 
+ /**
+  * MemberProfileForm
+  * ------------------
+- * React conversion of the "Member Profile Form" wireframe.
++ * Personal, residence, business and family details for one member.
+  *
+- * WHAT'S WIRED UP:
+- *  - All fields from the wireframe as controlled state
+- *  - Conditional sections: Board designation, Wife's section (married),
+- *    Wife's business (profession !== housewife), "Same as Husband" address copy
+- *  - Member profession dropdown (Housewife / Business / Service):
+- *      Business  -> shows the Business section
+- *      Service   -> shows the Service section (Company, Sector, Designation)
+- *      Housewife -> nothing extra
+- *  - Children repeater (add / remove, capped at 4)
+- *  - Geolocation capture button (📍 Use current location) for each address block
+- *  - A MapPicker for the business address so members can drop/drag a pin
+- *    instead of (or alongside) typing lat/lng manually
+- *  - Basic required-field validation
+- *  - Submit handler that POSTs to an API (multipart/form-data, so photo
+- *    files travel with the rest of the payload)
++ * ON LOCATIONS
++ * Four addresses on this page can carry a pin: the member's home, their
++ * business, and the spouse's home and business. Rendering four 360px maps
++ * at once buried the form and made every one of them fetch its own tiles,
++ * so each map now sits behind a "Set location on map" button (see
++ * LocationField) and opens only when it is wanted. The status line and the
++ * "Use current location" shortcut stay visible either way.
+  *
+- * HOW TO WIRE THE SAVE API:
+- *  Pass `apiEndpoint` (e.g. "/api/members") and optionally `authToken`.
+- *  On submit, this component builds a FormData object and POSTs it.
+- *  Adjust `buildFormData()` / `saveMember()` below to match your backend's
+- *  exact field names if they differ.
++ * Coordinates are never displayed. Members see "Location set" or "No
++ * location set yet"; the numbers live in form state and travel with the
++ * save payload.
++ *
++ * ON RELATIVES
++ * The spouse and each child are separate member records on the backend, not
++ * fields on this one. Their `memberId` is carried invisibly through the form
++ * so the save route can update the right record — without it, everything
++ * typed into those sections was quietly discarded on save.
+  */
+ 
+ // Strips anything that isn't a digit and caps the length — used on every
+@@ -42,6 +44,8 @@ import { withBase } from "@/lib/paths";
+ const digitsOnly = (value, maxLen = 10) => value.replace(/\D/g, "").slice(0, maxLen);
+ 
+ const emptyChild = () => ({
++  // Blank for a child who isn't on the backend yet.
++  memberId: "",
+   name: "",
+   dob: "",
+   education: "",
+@@ -64,12 +68,27 @@ const initialFormState = {
+     isMarried: true,
+     profession: "", // "" | "Housewife" | "Business" | "Service"
+   },
++  // The member's own home. This is what the backend stores as home_address
++  // + area_location + city + pincode + residence_latitude/longitude — it is
++  // separate from any business address, and the form had no room for it
++  // before, so a saved home address could never be seen or edited here.
++  residence: {
++    address: "",
++    area: "",
++    city: "",
++    pinCode: "",
++    lat: "",
++    lng: "",
++  },
+   service: {
+     company: "",
+     sector: "",
+     designation: "",
+   },
+   business: {
++    // Carried so a save updates this business instead of filing a new one
++    // every time.
++    businessId: "",
+     name: "",
+     description: "",
+     address1: "",
+@@ -78,6 +97,7 @@ const initialFormState = {
+     city: "",
+     pinCode: "",
+     natureOfBusiness: "",
++    subCategory: "",
+     officePhone: "",
+     email: "",
+     website: "",
+@@ -90,6 +110,8 @@ const initialFormState = {
+     gotra: "",
+   },
+   wife: {
++    // The spouse's own member record id — needed to save anything here.
++    memberId: "",
+     name: "",
+     fatherName: "",
+     profession: "",
+@@ -110,6 +132,7 @@ const initialFormState = {
+       lng: "",
+     },
+     business: {
++      businessId: "",
+       name: "",
+       description: "",
+       sameAsHusband: false,
+@@ -148,13 +171,34 @@ export default function MemberProfileForm({
+   initialValues = null,
+   onSaved = () => {},
+ }) {
++  
+   const [form, setForm] = useState(
+     initialValues ? deepMerge(initialFormState, initialValues) : initialFormState
+   );
+   const [errors, setErrors] = useState({});
+   const [saving, setSaving] = useState(false);
+   const [saveError, setSaveError] = useState("");
+-  const [saveSuccess, setSaveSuccess] = useState(false);
++  const [saveNotice, setSaveNotice] = useState("");
++  const router = useRouter();
++  // initialValues arrives after the first render (the portal fetches it) and
++  // again after every save. useState reads a prop once and never again, so
++  // without this the form kept showing whatever it was built with — which
++  // after a save meant stale or blank fields even though the server had the
++  // right data. The ref stops it looping on an identical payload.
++  const seededRef = useRef(null);
++  useEffect(() => {
++    if (!initialValues) return;
++    const stamp = JSON.stringify(initialValues);
++    if (seededRef.current === stamp) return;
++    seededRef.current = stamp;
++    setForm(deepMerge(initialFormState, initialValues));
++  }, [initialValues]);
++
++  // Banners sit at the top of a long page; without this the member presses
++  // Save at the bottom and sees nothing happen at all.
++  const scrollToTop = () => {
++    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
++  };
+ 
+   // ---- generic setters -----------------------------------------------
+ 
+@@ -162,6 +206,10 @@ export default function MemberProfileForm({
+     setForm((f) => ({ ...f, member: { ...f.member, ...patch } }));
+   }, []);
+ 
++  const setResidence = useCallback((patch) => {
++    setForm((f) => ({ ...f, residence: { ...f.residence, ...patch } }));
++  }, []);
++
+   const setBusiness = useCallback((patch) => {
+     setForm((f) => ({ ...f, business: { ...f.business, ...patch } }));
+   }, []);
+@@ -208,17 +256,19 @@ export default function MemberProfileForm({
+   }, []);
+ 
+   // ---- "same as husband" address copy ---------------------------------
++  // Copies from the member's HOME, not their business — "same as husband"
++  // on a residence field means the same house.
+ 
+   const toggleResidenceSameAsHusband = (checked) => {
+     if (checked) {
+       setWifeResidence({
+         sameAsHusband: true,
+-        address: form.business.address1,
+-        area: form.business.area,
+-        city: form.business.city,
+-        pinCode: form.business.pinCode,
+-        lat: form.business.lat,
+-        lng: form.business.lng,
++        address: form.residence.address,
++        area: form.residence.area,
++        city: form.residence.city,
++        pinCode: form.residence.pinCode,
++        lat: form.residence.lat,
++        lng: form.residence.lng,
+       });
+     } else {
+       setWifeResidence({ sameAsHusband: false });
+@@ -242,12 +292,12 @@ export default function MemberProfileForm({
+   };
+ 
+   // ---- geolocation ------------------------------------------------------
+-  // The "Use current location" button stays as a shortcut alongside the
+-  // MapPicker below — either one calls the matching setter with { lat, lng }.
++
+   const captureLocation = (setter, disabled) => {
+     if (disabled) return;
+     if (!navigator.geolocation) {
+       setSaveError("Geolocation is not supported in this browser.");
++      scrollToTop();
+       return;
+     }
+     navigator.geolocation.getCurrentPosition(
+@@ -259,6 +309,7 @@ export default function MemberProfileForm({
+       },
+       () => {
+         setSaveError("Could not get current location (permission denied or unavailable).");
++        scrollToTop();
+       },
+       {
+         // Without this, the browser often takes the fast path — resolving
+@@ -292,6 +343,7 @@ export default function MemberProfileForm({
+     reqMobile(form.member.mobile, "member.mobile");
+     if (form.member.isInBoard) req(form.member.boardDesignation, "member.boardDesignation");
+ 
++    req(form.residence.address, "residence.address");
+     req(form.member.profession, "member.profession");
+ 
+     if (form.member.profession === "Business") {
+@@ -335,6 +387,8 @@ export default function MemberProfileForm({
+     fd.append("member", JSON.stringify(memberRest));
+     if (photo) fd.append("memberPhoto", photo);
+ 
++    fd.append("residence", JSON.stringify(form.residence));
++
+     // Only the section matching the chosen profession is sent.
+     // (`profession` itself already travels inside the "member" JSON above.)
+     if (form.member.profession === "Business") {
+@@ -357,13 +411,39 @@ export default function MemberProfileForm({
+     return fd;
+   }
+ 
++  /**
++   * The member portal's endpoint takes JSON and already has the photos (they
++   * upload on their own as soon as they're picked), so files only need the
++   * multipart path used by the office's create-a-member route.
++   */
++  const usesJson = apiEndpoint.includes("/member/me");
++
+   async function saveMember() {
++<<<<<<< HEAD
+     const fd = buildFormData();
+     const res = await fetch(withBase(apiEndpoint), {
++=======
++    const res = await fetch(apiEndpoint, {
++>>>>>>> fonts_bugs_clear
+       method: "POST",
+-      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
+-      body: fd,
++      headers: usesJson
++        ? { "Content-Type": "application/json" }
++        : authToken
++        ? { Authorization: `Bearer ${authToken}` }
++        : undefined,
++      body: usesJson
++        ? JSON.stringify({
++            member: form.member,
++            residence: form.residence,
++            business: form.business,
++            service: form.service,
++            ancestry: form.ancestry,
++            wife: form.member.isMarried ? form.wife : null,
++            children: form.member.isMarried ? form.children : [],
++          })
++        : buildFormData(),
+     });
++
+     if (!res.ok) {
+       let message = `Save failed (HTTP ${res.status})`;
+       const raw = await res.text();
+@@ -384,675 +464,723 @@ export default function MemberProfileForm({
+ 
+   const handleSubmit = async () => {
+     setSaveError("");
+-    setSaveSuccess(false);
++    setSaveNotice("");
+     if (!validate()) {
+       setSaveError("Please fill in the required fields highlighted below.");
++      scrollToTop();
+       return;
+     }
+     setSaving(true);
+     try {
+       const result = await saveMember();
+-      setSaveSuccess(true);
++      // The portal route reports what it could and couldn't save — a child
++      // with no record yet, for instance. Showing its own message beats a
++      // blanket "saved" that quietly wasn't true for part of the form.
++      setSaveNotice(result?.message || "Saved successfully.");
++      scrollToTop();
+       onSaved(result);
+     } catch (err) {
+       setSaveError(err.message || "Something went wrong while saving.");
++      scrollToTop();
+     } finally {
+       setSaving(false);
+     }
+   };
+ 
+   const handleCancel = () => {
+-    setForm(initialFormState);
++    setForm(initialValues ? deepMerge(initialFormState, initialValues) : initialFormState);
+     setErrors({});
+     setSaveError("");
+-    setSaveSuccess(false);
++    setSaveNotice("");
++    scrollToTop();
+   };
+ 
+   return (
+     <div className="mpf-outer">
+       <div className="mpf-page">
+-      <style>{css}</style>
+-
+-      <header className="mpf-doc-head">
+-        <h1>Member profile form</h1>
+-        <p>Save a member's full profile — personal, business and family details.</p>
+-        <div className="mpf-legend">
+-          <span className="mpf-req">*</span> indicates a mandatory field
+-        </div>
+-      </header>
+-
+-      {saveError && <div className="mpf-banner mpf-banner-error">{saveError}</div>}
+-      {saveSuccess && <div className="mpf-banner mpf-banner-success">Member saved successfully.</div>}
++        <style>{css}</style>
+ 
+-      {/* 1. Member details */}
+-      <section className="mpf-card">
+-        <h2>1. Member details</h2>
+-        <div className="mpf-grid">
+-          <Field label="Member's name" required error={errFor("member.name")}>
+-            <input
+-              type="text"
+-              value={form.member.name}
+-              onChange={(e) => setMember({ name: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Husband's father's name" required error={errFor("member.husbandFatherName")}>
+-            <input
+-              type="text"
+-              value={form.member.husbandFatherName}
+-              onChange={(e) => setMember({ husbandFatherName: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Surname" required error={errFor("member.surname")}>
+-            <input
+-              type="text"
+-              value={form.member.surname}
+-              onChange={(e) => setMember({ surname: e.target.value })}
+-            />
+-          </Field>
+-          <DatePickerField
+-            label="Date of birth"
+-            required
+-            error={errFor("member.dob")}
+-            value={form.member.dob}
+-            onChange={(v) => setMember({ dob: v })}
+-          />
+-          <Field label="Education">
+-            <input
+-              type="text"
+-              value={form.member.education}
+-              onChange={(e) => setMember({ education: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Mobile number" required error={errFor("member.mobile")}>
+-            <input
+-              type="text"
+-              inputMode="numeric"
+-              maxLength={10}
+-              value={form.member.mobile}
+-              onChange={(e) => setMember({ mobile: digitsOnly(e.target.value) })}
+-            />
+-          </Field>
+-          <Field label="Alternate mobile">
+-            <input
+-              type="text"
+-              inputMode="numeric"
+-              maxLength={10}
+-              value={form.member.altMobile}
+-              onChange={(e) => setMember({ altMobile: digitsOnly(e.target.value) })}
+-            />
+-          </Field>
+-          <Field label="Individual photo">
+-            <input
+-              type="file"
+-              accept="image/*"
+-              onChange={(e) => setMember({ photo: e.target.files?.[0] || null })}
+-            />
+-          </Field>
+-        </div>
+-
+-        <div className="mpf-grid" style={{ marginTop: 10 }}>
+-          <Field label="Profession" required error={errFor("member.profession")}>
+-            <select
+-              value={form.member.profession}
+-              onChange={(e) => setMember({ profession: e.target.value })}
+-            >
+-              <option value="">Select profession</option>
+-              <option value="Housewife">Housewife</option>
+-              <option value="Business">Business</option>
+-              <option value="Service">Service</option>
+-            </select>
+-          </Field>
+-        </div>
+-
+-        <label className="mpf-inline-toggle">
+-          <input
+-            type="checkbox"
+-            checked={form.member.isInBoard}
+-            onChange={(e) => setMember({ isInBoard: e.target.checked })}
+-          />
+-          Is in board
+-        </label>
+-        {form.member.isInBoard && (
+-          <div className="mpf-grid" style={{ marginTop: 10 }}>
+-            <Field label="Board designation" required error={errFor("member.boardDesignation")}>
+-              <select
+-                value={form.member.boardDesignation}
+-                onChange={(e) => setMember({ boardDesignation: e.target.value })}
+-              >
+-                <option value="">Select designation</option>
+-                <option value="Chairman & Managing Director">Chairman & Managing Director</option>
+-                <option value="Directors">Directors</option>
+-                <option value="Senior Director">Senior Director</option>
+-                <option value="Secretary">Secretary</option>
+-                <option value="Joint Secretary">Joint Secretary</option>
+-                <option value="President">President</option>
+-                <option value="Vice President">Vice President</option>
+-                <option value="IPP - Immediate Past President">IPP - Immediate Past President</option>
+-                <option value="Executive Director">Executive Director</option>
+-                <option value="Treasurer">Treasurer</option>
+-              </select>
+-            </Field>
+-          </div>
+-        )}
+-
+-        <label className="mpf-inline-toggle">
+-          <input
+-            type="checkbox"
+-            checked={form.member.isMarried}
+-            onChange={(e) => setMember({ isMarried: e.target.checked })}
+-          />
+-          Married
+-        </label>
+-      </section>
+-
+-      {/* 2. Business — shown only when profession is Business */}
+-      {form.member.profession === "Business" && (
+-      <section className="mpf-card">
+-        <h2>2. Business</h2>
+-        <div className="mpf-grid">
+-          <Field label="Business name" required full error={errFor("business.name")}>
+-            <input
+-              type="text"
+-              value={form.business.name}
+-              onChange={(e) => setBusiness({ name: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Business description" full>
+-            <input
+-              type="text"
+-              value={form.business.description}
+-              onChange={(e) => setBusiness({ description: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Office address 1" required error={errFor("business.address1")}>
+-            <input
+-              type="text"
+-              value={form.business.address1}
+-              onChange={(e) => setBusiness({ address1: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Office address 2">
+-            <input
+-              type="text"
+-              value={form.business.address2}
+-              onChange={(e) => setBusiness({ address2: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Area">
+-            <input
+-              type="text"
+-              value={form.business.area}
+-              onChange={(e) => setBusiness({ area: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="City" required error={errFor("business.city")}>
+-            <input
+-              type="text"
+-              value={form.business.city}
+-              onChange={(e) => setBusiness({ city: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Pin code">
+-            <input
+-              type="text"
+-              value={form.business.pinCode}
+-              onChange={(e) => setBusiness({ pinCode: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Nature of business">
+-            <input
+-              type="text"
+-              value={form.business.natureOfBusiness}
+-              onChange={(e) => setBusiness({ natureOfBusiness: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Office phone">
+-            <input
+-              type="text"
+-              inputMode="numeric"
+-              maxLength={12}
+-              value={form.business.officePhone}
+-              onChange={(e) => setBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
+-            />
+-          </Field>
+-          <Field label="Email ID">
+-            <input
+-              type="text"
+-              value={form.business.email}
+-              onChange={(e) => setBusiness({ email: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Website" full>
+-            <input
+-              type="text"
+-              value={form.business.website}
+-              onChange={(e) => setBusiness({ website: e.target.value })}
+-            />
+-          </Field>
+-
+-          {/* Map picker — was accidentally left floating outside any
+-              component earlier (referencing an undefined `business`
+-              variable). Fixed: lives here in the Business section's JSX,
+-              wired to form.business.lat/lng via setBusiness. */}
+-          <div className="mpf-field-full">
+-            <MapPicker
+-              initialLat={form.business.lat}
+-              initialLng={form.business.lng}
+-              onLocationSelect={(lat, lng) => setBusiness({ lat, lng })}
+-            />
+-          </div>
+-
+-          <GeoRow
+-            lat={form.business.lat}
+-            lng={form.business.lng}
+-            onUseCurrent={() => captureLocation(setBusiness, false)}
+-          />
+-          <p className="mpf-location-hint">
+-            "Use current location" is approximate on laptops/desktops (no GPS chip) —
+-            for an exact address, click or drag the pin on the map above instead.
+-          </p>
+-        </div>
+-      </section>
+-      )}
+-
+-      {/* 2. Service — shown only when profession is Service */}
+-      {form.member.profession === "Service" && (
++        <header className="mpf-doc-head">
++  <div className="mpf-doc-head-top">
++    <div>
++      <h1>Member profile form</h1>
++      <p>Save a member&apos;s full profile — personal, business and family details.</p>
++    </div>
++    <button
++      type="button"
++      className="mpf-create-event-btn"
++      onClick={() => router.push("/create-event")}
++    >
++      + Create Event
++    </button>
++  </div>
++  <div className="mpf-legend">
++    <span className="mpf-req">*</span> indicates a mandatory field
++  </div>
++</header>
++
++        {saveError && <div className="mpf-banner mpf-banner-error">{saveError}</div>}
++        {saveNotice && <div className="mpf-banner mpf-banner-success">{saveNotice}</div>}
++
++        {/* 1. Member details */}
+         <section className="mpf-card">
+-          <h2>2. Service</h2>
+-          <div className="mpf-grid mpf-cols-3">
+-            <Field label="Company" required error={errFor("service.company")}>
++          <h2>1. Member details</h2>
++          <div className="mpf-grid">
++            <Field label="Member's name" required error={errFor("member.name")}>
+               <input
+                 type="text"
+-                value={form.service.company}
+-                onChange={(e) => setService({ company: e.target.value })}
++                value={form.member.name}
++                onChange={(e) => setMember({ name: e.target.value })}
+               />
+             </Field>
+-            <Field label="Sector">
++            <Field label="Husband's father's name" required error={errFor("member.husbandFatherName")}>
+               <input
+                 type="text"
+-                value={form.service.sector}
+-                onChange={(e) => setService({ sector: e.target.value })}
++                value={form.member.husbandFatherName}
++                onChange={(e) => setMember({ husbandFatherName: e.target.value })}
+               />
+             </Field>
+-            <Field label="Designation" required error={errFor("service.designation")}>
++            <Field label="Surname" required error={errFor("member.surname")}>
+               <input
+                 type="text"
+-                value={form.service.designation}
+-                onChange={(e) => setService({ designation: e.target.value })}
++                value={form.member.surname}
++                onChange={(e) => setMember({ surname: e.target.value })}
+               />
+             </Field>
+-          </div>
+-        </section>
+-      )}
+-
+-      {/* 3. Ancestry */}
+-      <section className="mpf-card">
+-        <h2>3. Ancestry</h2>
+-        <div className="mpf-grid mpf-cols-3">
+-          <Field label="Ancestral place">
+-            <input
+-              type="text"
+-              value={form.ancestry.place}
+-              onChange={(e) => setAncestry({ place: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Ancestral state">
+-            <input
+-              type="text"
+-              value={form.ancestry.state}
+-              onChange={(e) => setAncestry({ state: e.target.value })}
+-            />
+-          </Field>
+-          <Field label="Gotra">
+-            <input
+-              type="text"
+-              value={form.ancestry.gotra}
+-              onChange={(e) => setAncestry({ gotra: e.target.value })}
++            <DatePickerField
++              label="Date of birth"
++              required
++              error={errFor("member.dob")}
++              value={form.member.dob}
++              onChange={(v) => setMember({ dob: v })}
+             />
+-          </Field>
+-        </div>
+-      </section>
+-
+-      {/* 4. Wife's details */}
+-      {form.member.isMarried && (
+-        <section className="mpf-card">
+-          <h2>
+-            4. Wife's details <span className="mpf-toggle-hint">— shown only if member is married</span>
+-          </h2>
+-
+-          <h3 className="mpf-sub">4a. Personal</h3>
+-          <div className="mpf-grid">
+-            <Field label="Name" required error={errFor("wife.name")}>
++            <Field label="Education">
+               <input
+                 type="text"
+-                value={form.wife.name}
+-                onChange={(e) => setWife({ name: e.target.value })}
++                value={form.member.education}
++                onChange={(e) => setMember({ education: e.target.value })}
+               />
+             </Field>
+-            <Field label="Wife's father's name" required error={errFor("wife.fatherName")}>
++            <Field label="Mobile number" required error={errFor("member.mobile")}>
+               <input
+                 type="text"
+-                value={form.wife.fatherName}
+-                onChange={(e) => setWife({ fatherName: e.target.value })}
++                inputMode="numeric"
++                maxLength={10}
++                value={form.member.mobile}
++                onChange={(e) => setMember({ mobile: digitsOnly(e.target.value) })}
+               />
+             </Field>
+-            <Field label="Profession">
+-              <select
+-                value={form.wife.profession}
+-                onChange={(e) => setWife({ profession: e.target.value })}
+-              >
+-                <option value="">Select</option>
+-                <option value="housewife">Housewife</option>
+-                <option value="other">Other</option>
+-              </select>
+-            </Field>
+-            <Field label="Mobile number" required error={errFor("wife.mobile")}>
++            <Field label="Alternate mobile">
+               <input
+                 type="text"
+                 inputMode="numeric"
+                 maxLength={10}
+-                value={form.wife.mobile}
+-                onChange={(e) => setWife({ mobile: digitsOnly(e.target.value) })}
++                value={form.member.altMobile}
++                onChange={(e) => setMember({ altMobile: digitsOnly(e.target.value) })}
+               />
+             </Field>
+-            <Field label="Alternate contact">
++            <Field label="Individual photo">
+               <input
+-                type="text"
+-                inputMode="numeric"
+-                maxLength={10}
+-                value={form.wife.altContact}
+-                onChange={(e) => setWife({ altContact: digitsOnly(e.target.value) })}
++                type="file"
++                accept="image/*"
++                onChange={(e) => setMember({ photo: e.target.files?.[0] || null })}
+               />
+             </Field>
+-            <DatePickerField
+-              label="Date of birth"
+-              value={form.wife.dob}
+-              onChange={(v) => setWife({ dob: v })}
++          </div>
++
++          <div className="mpf-grid" style={{ marginTop: 10 }}>
++            <Field label="Profession" required error={errFor("member.profession")}>
++              <select
++                value={form.member.profession}
++                onChange={(e) => setMember({ profession: e.target.value })}
++              >
++                <option value="">Select profession</option>
++                <option value="Housewife">Housewife</option>
++                <option value="Business">Business</option>
++                <option value="Service">Service</option>
++              </select>
++            </Field>
++          </div>
++
++          <label className="mpf-inline-toggle">
++            <input
++              type="checkbox"
++              checked={form.member.isInBoard}
++              onChange={(e) => setMember({ isInBoard: e.target.checked })}
+             />
+-            <Field label="Education">
++            Is in board
++          </label>
++          {form.member.isInBoard && (
++            <div className="mpf-grid" style={{ marginTop: 10 }}>
++              <Field label="Board designation" required error={errFor("member.boardDesignation")}>
++                <select
++                  value={form.member.boardDesignation}
++                  onChange={(e) => setMember({ boardDesignation: e.target.value })}
++                >
++                  <option value="">Select designation</option>
++                  <option value="Chairman & Managing Director">Chairman &amp; Managing Director</option>
++                  <option value="Directors">Directors</option>
++                  <option value="Senior Director">Senior Director</option>
++                  <option value="Secretary">Secretary</option>
++                  <option value="Joint Secretary">Joint Secretary</option>
++                  <option value="President">President</option>
++                  <option value="Vice President">Vice President</option>
++                  <option value="IPP - Immediate Past President">IPP - Immediate Past President</option>
++                  <option value="Executive Director">Executive Director</option>
++                  <option value="Treasurer">Treasurer</option>
++                </select>
++              </Field>
++            </div>
++          )}
++
++          <label className="mpf-inline-toggle">
++            <input
++              type="checkbox"
++              checked={form.member.isMarried}
++              onChange={(e) => setMember({ isMarried: e.target.checked })}
++            />
++            Married
++          </label>
++        </section>
++
++        {/* 2. Residence — the member's own home */}
++        <section className="mpf-card">
++          <h2>2. Residence</h2>
++          <div className="mpf-grid">
++            <Field label="Home address" required full error={errFor("residence.address")}>
+               <input
+                 type="text"
+-                value={form.wife.education}
+-                onChange={(e) => setWife({ education: e.target.value })}
++                value={form.residence.address}
++                onChange={(e) => setResidence({ address: e.target.value })}
+               />
+             </Field>
+-            <Field label="Marriage anniversary">
++            <Field label="Area">
+               <input
+                 type="text"
+-                value={form.wife.anniversary}
+-                onChange={(e) => setWife({ anniversary: e.target.value })}
++                value={form.residence.area}
++                onChange={(e) => setResidence({ area: e.target.value })}
+               />
+             </Field>
+-            <Field label="Wife's photo">
++            <Field label="City">
+               <input
+-                type="file"
+-                accept="image/*"
+-                onChange={(e) => setWife({ photo: e.target.files?.[0] || null })}
++                type="text"
++                value={form.residence.city}
++                onChange={(e) => setResidence({ city: e.target.value })}
+               />
+             </Field>
+-            <Field label="Couple photo">
++            <Field label="Pin code">
+               <input
+-                type="file"
+-                accept="image/*"
+-                onChange={(e) => setWife({ couplePhoto: e.target.files?.[0] || null })}
++                type="text"
++                value={form.residence.pinCode}
++                onChange={(e) => setResidence({ pinCode: e.target.value })}
+               />
+             </Field>
++
++            <LocationField
++              label="Home location"
++              lat={form.residence.lat}
++              lng={form.residence.lng}
++              onSelect={(lat, lng) => setResidence({ lat, lng })}
++              onUseCurrent={() => captureLocation(setResidence, false)}
++            />
+           </div>
++        </section>
+ 
+-          <h3 className="mpf-sub">4b. Residence</h3>
+-          <div className="mpf-grid">
+-            <Field label="Residence address" required full error={errFor("wife.residence.address")}>
+-              <div className="mpf-address-row">
++        {/* 3. Business — shown only when profession is Business */}
++        {form.member.profession === "Business" && (
++          <section className="mpf-card">
++            <h2>3. Business</h2>
++            <div className="mpf-grid">
++              <Field label="Business name" required full error={errFor("business.name")}>
+                 <input
+                   type="text"
+-                  disabled={form.wife.residence.sameAsHusband}
+-                  value={form.wife.residence.address}
+-                  onChange={(e) => setWifeResidence({ address: e.target.value })}
++                  value={form.business.name}
++                  onChange={(e) => setBusiness({ name: e.target.value })}
+                 />
+-                <label className="mpf-same-as">
+-                  <input
+-                    type="checkbox"
+-                    checked={form.wife.residence.sameAsHusband}
+-                    onChange={(e) => toggleResidenceSameAsHusband(e.target.checked)}
+-                  />
+-                  Same as Husband
+-                </label>
+-              </div>
+-            </Field>
+-            <Field label="Residence area">
++              </Field>
++              <Field label="Business description" full>
++                <input
++                  type="text"
++                  value={form.business.description}
++                  onChange={(e) => setBusiness({ description: e.target.value })}
++                />
++              </Field>
++              <Field label="Office address 1" required error={errFor("business.address1")}>
++                <input
++                  type="text"
++                  value={form.business.address1}
++                  onChange={(e) => setBusiness({ address1: e.target.value })}
++                />
++              </Field>
++              <Field label="Office address 2">
++                <input
++                  type="text"
++                  value={form.business.address2}
++                  onChange={(e) => setBusiness({ address2: e.target.value })}
++                />
++              </Field>
++              <Field label="Area">
++                <input
++                  type="text"
++                  value={form.business.area}
++                  onChange={(e) => setBusiness({ area: e.target.value })}
++                />
++              </Field>
++              <Field label="City" required error={errFor("business.city")}>
++                <input
++                  type="text"
++                  value={form.business.city}
++                  onChange={(e) => setBusiness({ city: e.target.value })}
++                />
++              </Field>
++              <Field label="Pin code">
++                <input
++                  type="text"
++                  value={form.business.pinCode}
++                  onChange={(e) => setBusiness({ pinCode: e.target.value })}
++                />
++              </Field>
++              <Field label="Nature of business">
++                <input
++                  type="text"
++                  value={form.business.natureOfBusiness}
++                  onChange={(e) => setBusiness({ natureOfBusiness: e.target.value })}
++                />
++              </Field>
++              <Field label="Sub category">
++                <input
++                  type="text"
++                  value={form.business.subCategory}
++                  onChange={(e) => setBusiness({ subCategory: e.target.value })}
++                />
++              </Field>
++              <Field label="Office phone">
++                <input
++                  type="text"
++                  inputMode="numeric"
++                  maxLength={12}
++                  value={form.business.officePhone}
++                  onChange={(e) => setBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
++                />
++              </Field>
++              <Field label="Email ID">
++                <input
++                  type="text"
++                  value={form.business.email}
++                  onChange={(e) => setBusiness({ email: e.target.value })}
++                />
++              </Field>
++              <Field label="Website" full>
++                <input
++                  type="text"
++                  value={form.business.website}
++                  onChange={(e) => setBusiness({ website: e.target.value })}
++                />
++              </Field>
++
++              <LocationField
++                label="Business location"
++                lat={form.business.lat}
++                lng={form.business.lng}
++                onSelect={(lat, lng) => setBusiness({ lat, lng })}
++                onUseCurrent={() => captureLocation(setBusiness, false)}
++              />
++            </div>
++          </section>
++        )}
++
++        {/* 3. Service — shown only when profession is Service */}
++        {form.member.profession === "Service" && (
++          <section className="mpf-card">
++            <h2>3. Service</h2>
++            <div className="mpf-grid mpf-cols-3">
++              <Field label="Company" required error={errFor("service.company")}>
++                <input
++                  type="text"
++                  value={form.service.company}
++                  onChange={(e) => setService({ company: e.target.value })}
++                />
++              </Field>
++              <Field label="Sector">
++                <input
++                  type="text"
++                  value={form.service.sector}
++                  onChange={(e) => setService({ sector: e.target.value })}
++                />
++              </Field>
++              <Field label="Designation" required error={errFor("service.designation")}>
++                <input
++                  type="text"
++                  value={form.service.designation}
++                  onChange={(e) => setService({ designation: e.target.value })}
++                />
++              </Field>
++            </div>
++          </section>
++        )}
++
++        {/* 4. Ancestry */}
++        <section className="mpf-card">
++          <h2>4. Ancestry</h2>
++          <div className="mpf-grid mpf-cols-3">
++            <Field label="Ancestral place">
+               <input
+                 type="text"
+-                disabled={form.wife.residence.sameAsHusband}
+-                value={form.wife.residence.area}
+-                onChange={(e) => setWifeResidence({ area: e.target.value })}
++                value={form.ancestry.place}
++                onChange={(e) => setAncestry({ place: e.target.value })}
+               />
+             </Field>
+-            <Field label="Residence city">
++            <Field label="Ancestral state">
+               <input
+                 type="text"
+-                disabled={form.wife.residence.sameAsHusband}
+-                value={form.wife.residence.city}
+-                onChange={(e) => setWifeResidence({ city: e.target.value })}
++                value={form.ancestry.state}
++                onChange={(e) => setAncestry({ state: e.target.value })}
+               />
+             </Field>
+-            <Field label="Residence pin code">
++            <Field label="Gotra">
+               <input
+                 type="text"
+-                disabled={form.wife.residence.sameAsHusband}
+-                value={form.wife.residence.pinCode}
+-                onChange={(e) => setWifeResidence({ pinCode: e.target.value })}
++                value={form.ancestry.gotra}
++                onChange={(e) => setAncestry({ gotra: e.target.value })}
+               />
+             </Field>
++          </div>
++        </section>
+ 
+-            {!form.wife.residence.sameAsHusband && (
+-              <div className="mpf-field-full">
+-                <MapPicker
+-                  initialLat={form.wife.residence.lat}
+-                  initialLng={form.wife.residence.lng}
+-                  onLocationSelect={(lat, lng) => setWifeResidence({ lat, lng })}
++        {/* 5. Wife's details */}
++        {form.member.isMarried && (
++          <section className="mpf-card">
++            <h2>
++              5. Wife&apos;s details{" "}
++              <span className="mpf-toggle-hint">
++                {form.wife.memberId
++                  ? "— shown only if member is married"
++                  : "— no linked record yet, so changes here cannot be saved"}
++              </span>
++            </h2>
++
++            <h3 className="mpf-sub">5a. Personal</h3>
++            <div className="mpf-grid">
++              <Field label="Name" required error={errFor("wife.name")}>
++                <input
++                  type="text"
++                  value={form.wife.name}
++                  onChange={(e) => setWife({ name: e.target.value })}
+                 />
+-              </div>
+-            )}
+-
+-            <GeoRow
+-              lat={form.wife.residence.lat}
+-              lng={form.wife.residence.lng}
+-              disabled={form.wife.residence.sameAsHusband}
+-              onUseCurrent={() => captureLocation(setWifeResidence, form.wife.residence.sameAsHusband)}
+-            />
+-          </div>
++              </Field>
++              <Field label="Wife's father's name" required error={errFor("wife.fatherName")}>
++                <input
++                  type="text"
++                  value={form.wife.fatherName}
++                  onChange={(e) => setWife({ fatherName: e.target.value })}
++                />
++              </Field>
++              <Field label="Profession">
++                <select
++                  value={form.wife.profession}
++                  onChange={(e) => setWife({ profession: e.target.value })}
++                >
++                  <option value="">Select</option>
++                  <option value="housewife">Housewife</option>
++                  <option value="other">Other</option>
++                </select>
++              </Field>
++              <Field label="Mobile number" required error={errFor("wife.mobile")}>
++                <input
++                  type="text"
++                  inputMode="numeric"
++                  maxLength={10}
++                  value={form.wife.mobile}
++                  onChange={(e) => setWife({ mobile: digitsOnly(e.target.value) })}
++                />
++              </Field>
++              <Field label="Alternate contact">
++                <input
++                  type="text"
++                  inputMode="numeric"
++                  maxLength={10}
++                  value={form.wife.altContact}
++                  onChange={(e) => setWife({ altContact: digitsOnly(e.target.value) })}
++                />
++              </Field>
++              <DatePickerField
++                label="Date of birth"
++                value={form.wife.dob}
++                onChange={(v) => setWife({ dob: v })}
++              />
++              <Field label="Education">
++                <input
++                  type="text"
++                  value={form.wife.education}
++                  onChange={(e) => setWife({ education: e.target.value })}
++                />
++              </Field>
++              <DatePickerField
++                label="Marriage anniversary"
++                value={form.wife.anniversary}
++                onChange={(v) => setWife({ anniversary: v })}
++              />
++              <Field label="Wife's photo">
++                <input
++                  type="file"
++                  accept="image/*"
++                  onChange={(e) => setWife({ photo: e.target.files?.[0] || null })}
++                />
++              </Field>
++              <Field label="Couple photo">
++                <input
++                  type="file"
++                  accept="image/*"
++                  onChange={(e) => setWife({ couplePhoto: e.target.files?.[0] || null })}
++                />
++              </Field>
++            </div>
+ 
+-          {form.wife.profession && form.wife.profession !== "housewife" && (
+-            <>
+-              <h3 className="mpf-sub">
+-                4c. Business <span className="mpf-toggle-hint">— shown only if profession is not Housewife</span>
+-              </h3>
+-              <div className="mpf-grid">
+-                <Field label="Business name" full>
+-                  <input
+-                    type="text"
+-                    value={form.wife.business.name}
+-                    onChange={(e) => setWifeBusiness({ name: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Business description" full>
++            <h3 className="mpf-sub">5b. Residence</h3>
++            <div className="mpf-grid">
++              <Field label="Residence address" required full error={errFor("wife.residence.address")}>
++                <div className="mpf-address-row">
+                   <input
+                     type="text"
+-                    value={form.wife.business.description}
+-                    onChange={(e) => setWifeBusiness({ description: e.target.value })}
++                    disabled={form.wife.residence.sameAsHusband}
++                    value={form.wife.residence.address}
++                    onChange={(e) => setWifeResidence({ address: e.target.value })}
+                   />
+-                </Field>
++                  <label className="mpf-same-as">
++                    <input
++                      type="checkbox"
++                      checked={form.wife.residence.sameAsHusband}
++                      onChange={(e) => toggleResidenceSameAsHusband(e.target.checked)}
++                    />
++                    Same as Husband
++                  </label>
++                </div>
++              </Field>
++              <Field label="Residence area">
++                <input
++                  type="text"
++                  disabled={form.wife.residence.sameAsHusband}
++                  value={form.wife.residence.area}
++                  onChange={(e) => setWifeResidence({ area: e.target.value })}
++                />
++              </Field>
++              <Field label="Residence city">
++                <input
++                  type="text"
++                  disabled={form.wife.residence.sameAsHusband}
++                  value={form.wife.residence.city}
++                  onChange={(e) => setWifeResidence({ city: e.target.value })}
++                />
++              </Field>
++              <Field label="Residence pin code">
++                <input
++                  type="text"
++                  disabled={form.wife.residence.sameAsHusband}
++                  value={form.wife.residence.pinCode}
++                  onChange={(e) => setWifeResidence({ pinCode: e.target.value })}
++                />
++              </Field>
+ 
+-                <Field label="Office address" required full error={errFor("wife.business.address")}>
+-                  <div className="mpf-address-row">
++              <LocationField
++                label="Residence location"
++                lat={form.wife.residence.lat}
++                lng={form.wife.residence.lng}
++                disabled={form.wife.residence.sameAsHusband}
++                onSelect={(lat, lng) => setWifeResidence({ lat, lng })}
++                onUseCurrent={() => captureLocation(setWifeResidence, form.wife.residence.sameAsHusband)}
++              />
++            </div>
++
++            {form.wife.profession && form.wife.profession !== "housewife" && (
++              <>
++                <h3 className="mpf-sub">
++                  5c. Business <span className="mpf-toggle-hint">— shown only if profession is not Housewife</span>
++                </h3>
++                <div className="mpf-grid">
++                  <Field label="Business name" full>
+                     <input
+                       type="text"
+-                      disabled={form.wife.business.sameAsHusband}
+-                      value={form.wife.business.address}
+-                      onChange={(e) => setWifeBusiness({ address: e.target.value })}
++                      value={form.wife.business.name}
++                      onChange={(e) => setWifeBusiness({ name: e.target.value })}
+                     />
+-                    <label className="mpf-same-as">
++                  </Field>
++                  <Field label="Business description" full>
++                    <input
++                      type="text"
++                      value={form.wife.business.description}
++                      onChange={(e) => setWifeBusiness({ description: e.target.value })}
++                    />
++                  </Field>
++
++                  <Field label="Office address" required full error={errFor("wife.business.address")}>
++                    <div className="mpf-address-row">
+                       <input
+-                        type="checkbox"
+-                        checked={form.wife.business.sameAsHusband}
+-                        onChange={(e) => toggleWifeBusinessSameAsHusband(e.target.checked)}
++                        type="text"
++                        disabled={form.wife.business.sameAsHusband}
++                        value={form.wife.business.address}
++                        onChange={(e) => setWifeBusiness({ address: e.target.value })}
+                       />
+-                      Same as Husband
+-                    </label>
+-                  </div>
+-                </Field>
++                      <label className="mpf-same-as">
++                        <input
++                          type="checkbox"
++                          checked={form.wife.business.sameAsHusband}
++                          onChange={(e) => toggleWifeBusinessSameAsHusband(e.target.checked)}
++                        />
++                        Same as Husband
++                      </label>
++                    </div>
++                  </Field>
++
++                  <Field label="Area">
++                    <input
++                      type="text"
++                      disabled={form.wife.business.sameAsHusband}
++                      value={form.wife.business.area}
++                      onChange={(e) => setWifeBusiness({ area: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="City">
++                    <input
++                      type="text"
++                      disabled={form.wife.business.sameAsHusband}
++                      value={form.wife.business.city}
++                      onChange={(e) => setWifeBusiness({ city: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="Pin code">
++                    <input
++                      type="text"
++                      disabled={form.wife.business.sameAsHusband}
++                      value={form.wife.business.pinCode}
++                      onChange={(e) => setWifeBusiness({ pinCode: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="Nature of business">
++                    <input
++                      type="text"
++                      value={form.wife.business.natureOfBusiness}
++                      onChange={(e) => setWifeBusiness({ natureOfBusiness: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="Office phone">
++                    <input
++                      type="text"
++                      inputMode="numeric"
++                      maxLength={12}
++                      value={form.wife.business.officePhone}
++                      onChange={(e) => setWifeBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
++                    />
++                  </Field>
++                  <Field label="Email ID">
++                    <input
++                      type="text"
++                      value={form.wife.business.email}
++                      onChange={(e) => setWifeBusiness({ email: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="Website" full>
++                    <input
++                      type="text"
++                      value={form.wife.business.website}
++                      onChange={(e) => setWifeBusiness({ website: e.target.value })}
++                    />
++                  </Field>
+ 
+-                <Field label="Area">
+-                  <input
+-                    type="text"
+-                    disabled={form.wife.business.sameAsHusband}
+-                    value={form.wife.business.area}
+-                    onChange={(e) => setWifeBusiness({ area: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="City">
+-                  <input
+-                    type="text"
++                  <LocationField
++                    label="Business location"
++                    lat={form.wife.business.lat}
++                    lng={form.wife.business.lng}
+                     disabled={form.wife.business.sameAsHusband}
+-                    value={form.wife.business.city}
+-                    onChange={(e) => setWifeBusiness({ city: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Pin code">
+-                  <input
+-                    type="text"
+-                    disabled={form.wife.business.sameAsHusband}
+-                    value={form.wife.business.pinCode}
+-                    onChange={(e) => setWifeBusiness({ pinCode: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Nature of business">
+-                  <input
+-                    type="text"
+-                    value={form.wife.business.natureOfBusiness}
+-                    onChange={(e) => setWifeBusiness({ natureOfBusiness: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Office phone">
+-                  <input
+-                    type="text"
+-                    inputMode="numeric"
+-                    maxLength={12}
+-                    value={form.wife.business.officePhone}
+-                    onChange={(e) => setWifeBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
+-                  />
+-                </Field>
+-                <Field label="Email ID">
+-                  <input
+-                    type="text"
+-                    value={form.wife.business.email}
+-                    onChange={(e) => setWifeBusiness({ email: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Website" full>
+-                  <input
+-                    type="text"
+-                    value={form.wife.business.website}
+-                    onChange={(e) => setWifeBusiness({ website: e.target.value })}
++                    onSelect={(lat, lng) => setWifeBusiness({ lat, lng })}
++                    onUseCurrent={() => captureLocation(setWifeBusiness, form.wife.business.sameAsHusband)}
+                   />
+-                </Field>
+-
+-                {!form.wife.business.sameAsHusband && (
+-                  <div className="mpf-field-full">
+-                    <MapPicker
+-                      initialLat={form.wife.business.lat}
+-                      initialLng={form.wife.business.lng}
+-                      onLocationSelect={(lat, lng) => setWifeBusiness({ lat, lng })}
+-                    />
+-                  </div>
+-                )}
+-
+-                <GeoRow
+-                  lat={form.wife.business.lat}
+-                  lng={form.wife.business.lng}
+-                  disabled={form.wife.business.sameAsHusband}
+-                  onUseCurrent={() => captureLocation(setWifeBusiness, form.wife.business.sameAsHusband)}
+-                />
+-              </div>
+-            </>
+-          )}
+-        </section>
+-      )}
++                </div>
++              </>
++            )}
++          </section>
++        )}
+ 
+-      {/* 5. Children */}
+-      {form.member.isMarried && (
+-        <section className="mpf-card">
+-          <h2>
+-            5. Children <span className="mpf-toggle-hint">— shown only if member is married</span>
+-          </h2>
+-          <div className="mpf-note">Same field set repeats per child, up to 4</div>
+-
+-          {form.children.map((child, i) => (
+-            <div className="mpf-repeat-block" key={i}>
+-              <div className="mpf-repeat-label-row">
+-                <span className="mpf-repeat-label">Child {i + 1}</span>
+-                {form.children.length > 1 && (
+-                  <button type="button" className="mpf-remove" onClick={() => removeChild(i)}>
+-                    Remove
+-                  </button>
+-                )}
+-              </div>
+-              <div className="mpf-grid">
+-                <Field label="Name" required error={errFor(`children.${i}.name`)}>
+-                  <input
+-                    type="text"
+-                    value={child.name}
+-                    onChange={(e) => setChild(i, { name: e.target.value })}
+-                  />
+-                </Field>
+-                <DatePickerField
+-                  label="Date of birth"
+-                  value={child.dob}
+-                  onChange={(v) => setChild(i, { dob: v })}
+-                />
+-                <Field label="Education">
+-                  <input
+-                    type="text"
+-                    value={child.education}
+-                    onChange={(e) => setChild(i, { education: e.target.value })}
+-                  />
+-                </Field>
+-                <Field label="Mobile number">
+-                  <input
+-                    type="text"
+-                    inputMode="numeric"
+-                    maxLength={10}
+-                    value={child.mobile}
+-                    onChange={(e) => setChild(i, { mobile: digitsOnly(e.target.value) })}
+-                  />
+-                </Field>
+-                <Field label="Additional info" full>
+-                  <input
+-                    type="text"
+-                    value={child.additionalInfo}
+-                    onChange={(e) => setChild(i, { additionalInfo: e.target.value })}
++        {/* 6. Children */}
++        {form.member.isMarried && (
++          <section className="mpf-card">
++            <h2>
++              6. Children <span className="mpf-toggle-hint">— shown only if member is married</span>
++            </h2>
++            <div className="mpf-note">
++              Same field set repeats per child, up to 4. Children already on the record can be
++              edited here; a brand-new child has to be added by the club office, because each
++              child is a member record of their own.
++            </div>
++
++            {form.children.map((child, i) => (
++              <div className="mpf-repeat-block" key={child.memberId || i}>
++                <div className="mpf-repeat-label-row">
++                  <span className="mpf-repeat-label">
++                    Child {i + 1}
++                    {!child.memberId && child.name ? " — not yet on record" : ""}
++                  </span>
++                  {form.children.length > 1 && (
++                    <button type="button" className="mpf-remove" onClick={() => removeChild(i)}>
++                      Remove
++                    </button>
++                  )}
++                </div>
++                <div className="mpf-grid">
++                  <Field label="Name" required error={errFor(`children.${i}.name`)}>
++                    <input
++                      type="text"
++                      value={child.name}
++                      onChange={(e) => setChild(i, { name: e.target.value })}
++                    />
++                  </Field>
++                  <DatePickerField
++                    label="Date of birth"
++                    value={child.dob}
++                    onChange={(v) => setChild(i, { dob: v })}
+                   />
+-                </Field>
++                  <Field label="Education">
++                    <input
++                      type="text"
++                      value={child.education}
++                      onChange={(e) => setChild(i, { education: e.target.value })}
++                    />
++                  </Field>
++                  <Field label="Mobile number">
++                    <input
++                      type="text"
++                      inputMode="numeric"
++                      maxLength={10}
++                      value={child.mobile}
++                      onChange={(e) => setChild(i, { mobile: digitsOnly(e.target.value) })}
++                    />
++                  </Field>
++                  <Field label="Additional info" full>
++                    <input
++                      type="text"
++                      value={child.additionalInfo}
++                      onChange={(e) => setChild(i, { additionalInfo: e.target.value })}
++                    />
++                  </Field>
++                </div>
+               </div>
+-            </div>
+-          ))}
++            ))}
+ 
+-          {form.children.length < 4 && (
+-            <button type="button" className="mpf-ghost" onClick={addChild}>
+-              + Add another child
+-            </button>
+-          )}
+-        </section>
+-      )}
++            {form.children.length < 4 && (
++              <button type="button" className="mpf-ghost" onClick={addChild}>
++                + Add another child
++              </button>
++            )}
++          </section>
++        )}
+ 
+-      <div className="mpf-actions">
+-        <button type="button" className="mpf-cancel" onClick={handleCancel} disabled={saving}>
+-          Cancel
+-        </button>
+-        <button type="button" className="mpf-save" onClick={handleSubmit} disabled={saving}>
+-          {saving ? "Saving…" : "Save member"}
+-        </button>
+-      </div>
++        <div className="mpf-actions">
++          <button type="button" className="mpf-cancel" onClick={handleCancel} disabled={saving}>
++            Cancel
++          </button>
++          <button type="button" className="mpf-save" onClick={handleSubmit} disabled={saving}>
++            {saving ? "Saving…" : "Save"}
++          </button>
++        </div>
+       </div>
+     </div>
+   );
+@@ -1079,25 +1207,56 @@ function Field({ label, required, full, error, children }) {
+   );
+ }
+ 
+-// Deliberately does NOT render the raw lat/lng numbers — the member only
+-// ever sees a status ("Location set" / "No location set") and picks the
+-// spot visually (map pin or this button). The actual coordinates still
+-// live in form state exactly as before and travel to the backend via the
+-// normal save payload (buildFormData/saveMember) — they're just never
+-// shown on screen.
+-function GeoRow({ lat, lng, disabled, onUseCurrent }) {
++/**
++ * Status line, a "Use current location" shortcut, and a map that stays shut
++ * until asked for.
++ *
++ * Four of these appear on a full profile. Rendering every map immediately
++ * turned the page into a wall of tiles and made each one fetch its own
++ * imagery on load, so the map is mounted only once the button is pressed —
++ * which also means a member who never touches locations never pays for a
++ * single map.
++ *
++ * The coordinates themselves are deliberately never rendered. They live in
++ * form state and travel with the save payload.
++ */
++function LocationField({ label = "Location", lat, lng, disabled, onSelect, onUseCurrent }) {
++  const [open, setOpen] = useState(false);
+   const hasLocation = !!(lat && lng);
++
+   return (
+-    <div className="mpf-geo-row">
+-      <div className="mpf-geo-status">
+-        <span className={"mpf-geo-dot" + (hasLocation ? " mpf-geo-dot-set" : "")} aria-hidden="true" />
+-        <span className="mpf-geo-status-text">
+-          {hasLocation ? "📍 Location set" : "No location set yet"}
+-        </span>
++    <div className="mpf-loc">
++      <div className="mpf-geo-row">
++        <div className="mpf-geo-status">
++          <span className={"mpf-geo-dot" + (hasLocation ? " mpf-geo-dot-set" : "")} aria-hidden="true" />
++          <span className="mpf-geo-status-text">
++            {label}: {hasLocation ? "📍 set" : "not set yet"}
++          </span>
++        </div>
++        <div className="mpf-geo-actions">
++          <button
++            type="button"
++            className="mpf-geo-btn"
++            disabled={disabled}
++            onClick={() => setOpen((o) => !o)}
++          >
++            {open ? "Hide map" : hasLocation ? "Change on map" : "Set on map"}
++          </button>
++          <button type="button" className="mpf-geo-btn" disabled={disabled} onClick={onUseCurrent}>
++            Use current location
++          </button>
++        </div>
+       </div>
+-      <button type="button" className="mpf-geo-btn" disabled={disabled} onClick={onUseCurrent}>
+-        Use current location
+-      </button>
++
++      {open && !disabled && (
++        <div className="mpf-loc-map">
++          <MapPicker initialLat={lat} initialLng={lng} onLocationSelect={onSelect} />
++          <p className="mpf-location-hint">
++            &quot;Use current location&quot; is approximate on laptops (no GPS chip) —
++            for an exact spot, click or drag the pin.
++          </p>
++        </div>
++      )}
+     </div>
+   );
+ }
+@@ -1143,9 +1302,9 @@ function DatePickerField({ label, value, onChange, required, error }) {
+   const parsed = value ? new Date(value) : null;
+   const [viewYear, setViewYear] = useState((parsed && !isNaN(parsed)) ? parsed.getFullYear() : today.getFullYear());
+   const [viewMonth, setViewMonth] = useState((parsed && !isNaN(parsed)) ? parsed.getMonth() : today.getMonth());
+-  const wrapRef = React.useRef(null);
++  const wrapRef = useRef(null);
+ 
+-  React.useEffect(() => {
++  useEffect(() => {
+     function onOutside(e) {
+       if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+     }
+@@ -1225,14 +1384,9 @@ function DatePickerField({ label, value, onChange, required, error }) {
+   );
+ }
+ 
+-// ---- styles (ported from the wireframe) -------------------------------
++// ---- styles -----------------------------------------------------------
+ 
+ const css = `
+-  /* Full-width wrapper: carries the background and fills the whole
+-     viewport edge-to-edge, so there's no black/blank strip on either
+-     side on wide laptop screens. The actual card content still sits in
+-     a max-width column below — this only changes the empty space around
+-     it, NOT the 2-column field grid, which stays exactly as it was. */
+   .mpf-outer {
+     --border: #B9B6AC;
+     --border-light: #D8D5CB;
+@@ -1242,7 +1396,6 @@ const css = `
+     --text-muted: #7A776E;
+     --accent: #B3413A;
+     width: 100%;
+-    min-height: 100vh;
+     background: var(--surface);
+     color: var(--text);
+     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+@@ -1284,8 +1437,6 @@ const css = `
+   .mpf-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px 16px; margin-top: 12px; }
+   .mpf-cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
+ 
+-  /* Responsive: 4 columns is a laptop/desktop layout. Step down as the
+-     viewport shrinks so fields never get squeezed unreadably narrow. */
+   @media (max-width: 900px) {
+     .mpf-grid, .mpf-cols-3 { grid-template-columns: repeat(2, minmax(0,1fr)); }
+   }
+@@ -1311,22 +1462,51 @@ const css = `
+     border-width: 1.5px !important;
+     background: #FDF3F2;
+   }
++    .mpf-doc-head-top {
++  display: flex;
++  align-items: flex-start;
++  justify-content: space-between;
++  gap: 12px;
++  flex-wrap: wrap;
++}
++.mpf-create-event-btn {
++  height: 36px;
++  padding: 0 16px;
++  border-radius: 6px;
++  border: none;
++  background: var(--accent);
++  color: #fff;
++  font-size: 13px;
++  font-weight: 600;
++  cursor: pointer;
++  white-space: nowrap;
++}
++.mpf-create-event-btn:hover { opacity: 0.9; }
+ 
+   .mpf-address-row { display: flex; align-items: flex-end; gap: 10px; }
+-  .mpf-address-row .mpf-field { flex: 1; }
++  .mpf-address-row input { flex: 1; }
+   .mpf-same-as { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; white-space: nowrap; font-size: 12.5px; color: var(--text); }
+   .mpf-same-as input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
+ 
+-  .mpf-geo-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; grid-column: 1 / -1; }
++  /* Collapsible location block */
++  .mpf-loc { grid-column: 1 / -1; margin-top: 4px; }
++  .mpf-loc-map { margin-top: 10px; }
++  .mpf-geo-row {
++    display: flex; align-items: center; justify-content: space-between;
++    gap: 10px; flex-wrap: wrap;
++    background: #F7F6F2; border: 1px solid var(--border-light);
++    border-radius: 8px; padding: 10px 12px;
++  }
+   .mpf-geo-status { display: flex; align-items: center; gap: 8px; }
+   .mpf-geo-dot { width: 8px; height: 8px; border-radius: 4px; background: var(--border); flex-shrink: 0; }
+   .mpf-geo-dot-set { background: #2E6B3E; }
+   .mpf-geo-status-text { font-size: 12.5px; color: var(--text-muted); }
+-  .mpf-geo-btn { height: 34px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap; }
++  .mpf-geo-actions { display: flex; gap: 8px; flex-wrap: wrap; }
++  .mpf-geo-btn { height: 32px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap; }
+   .mpf-geo-btn:disabled { color: var(--text-muted); cursor: not-allowed; }
+ 
+   .mpf-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; font-style: italic; }
+-  .mpf-location-hint { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); margin: 6px 0 0; font-style: italic; }
++  .mpf-location-hint { font-size: 11.5px; color: var(--text-muted); margin: 6px 0 0; font-style: italic; }
+ 
+   .mpf-repeat-block { border: 1px dashed var(--border); border-radius: 8px; padding: 14px 16px; margin-top: 8px; }
+   .mpf-repeat-label-row { display: flex; align-items: center; justify-content: space-between; }
+@@ -1340,8 +1520,6 @@ const css = `
+   .mpf-save { background: var(--text); color: #fff; font-weight: 600; }
+   .mpf-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
+ 
+-  /* Custom date picker (replaces the native <input type="date">, whose
+-     calendar icon doesn't render visibly in every browser/zoom setup) */
+   .mpf-date-trigger {
+     height: 34px; width: 100%; border: 1px solid var(--border); border-radius: 6px;
+     padding: 0 10px; background: var(--card); font-size: 13px; cursor: pointer;
+@@ -1374,4 +1552,4 @@ const css = `
+   }
+   .mpf-date-day:hover { background: #F0EFEA; }
+   .mpf-date-day-selected { background: var(--accent); color: #fff; font-weight: 700; }
+-`;
+\ No newline at end of file
++`;
+diff --git a/lib/frappe.js b/lib/frappe.js
+index edc6574..82201eb 100644
+--- a/lib/frappe.js
++++ b/lib/frappe.js
+@@ -15,12 +15,19 @@ export const FRAPPE_METHODS = {
+   verifyOtp: `${PREFIX}.auth.verify_firebase_otp`,
+   getMemberDetails: `${PREFIX}.members_api.get_member_details`,
+ 
+-  // ⚠️ CONFIRM: the Postman collection has an "Update Member API" but we
+-  // haven't pinned its exact method name from the web side yet. The RN app's
+-  // src/api/members.ts calls the real one — copy that path here.
+-  updateMember: `${PREFIX}.members_api.update_member_profile`,
++  // Confirmed against the mobile app's src/api/members.ts. This lives under
++  // update_member, NOT members_api — an earlier guess pointed at
++  // members_api.update_member_profile, which does not exist. It also doubles
++  // as the create/update business endpoint; there is no separate one.
++  updateMember: `${PREFIX}.update_member.update_member`,
+ 
+-  // Two-step photo flow, same as the RN app's src/api/photo.ts.
++  // Who is allowed to create events. Same method the mobile app's
++  // Board Members screen uses.
++  getBoardMembers: `${PREFIX}.board_member_api.get_board_members`,
++
++  createEvent: `${PREFIX}.event_api.create_event`,
++
++  // Two-step photo flow, same as the mobile app's src/api/photo.ts.
+   uploadFile: "/api/method/upload_file",
+   linkPhoto: `${PREFIX}.upload_photo.upload_member_photo`,
+ };
+@@ -37,6 +44,18 @@ function authHeader() {
+   return `token ${API_KEY}:${API_SECRET}`;
+ }
+ 
++function unwrap(text, status, path) {
++  let data = {};
++  try {
++    data = JSON.parse(text);
++  } catch {
++    // Non-JSON almost always means the method path is wrong and Frappe's
++    // HTML error page came back.
++    throw new Error(`Backend returned non-JSON (HTTP ${status}) for ${path}`);
++  }
++  return data;
++}
++
+ /**
+  * POSTs JSON to a whitelisted Frappe method and unwraps `message`.
+  * Frappe puts real errors in the body, not the status text, so those are
+@@ -55,20 +74,34 @@ export async function frappePost(path, body) {
+     cache: "no-store",
+   });
+ 
+-  const text = await res.text();
+-  let data = {};
+-  try {
+-    data = JSON.parse(text);
+-  } catch {
+-    // Non-JSON almost always means the method path is wrong and Frappe's
+-    // HTML error page came back.
+-    throw new Error(`Backend returned non-JSON (HTTP ${res.status}) for ${path}`);
+-  }
++  const data = unwrap(await res.text(), res.status, path);
+ 
+   if (!res.ok) {
+     throw new Error(extractFrappeError(data) || `Backend returned HTTP ${res.status}`);
+   }
++  return data.message ?? data;
++}
++
++/** GET variant — some whitelisted methods only accept GET. */
++export async function frappeGet(path, params) {
++  assertFrappeEnv();
++
++  const url = new URL(`${BASE_URL}${path}`);
++  Object.entries(params ?? {}).forEach(([k, v]) => {
++    if (v != null) url.searchParams.set(k, String(v));
++  });
++
++  const res = await fetch(url, {
++    method: "GET",
++    headers: { Authorization: authHeader() },
++    cache: "no-store",
++  });
++
++  const data = unwrap(await res.text(), res.status, path);
+ 
++  if (!res.ok) {
++    throw new Error(extractFrappeError(data) || `Backend returned HTTP ${res.status}`);
++  }
+   return data.message ?? data;
+ }
+ 
+@@ -90,6 +123,24 @@ export async function frappeUpload(path, formData) {
+   return data.message ?? data;
+ }
+ 
++/**
++ * True if this member sits on the board. Used to decide who may create
++ * events. Failures deliberately return false rather than throwing — if the
++ * board list cannot be read, nobody gets event-creation rights, which is the
++ * safe direction to fail in.
++ */
++export async function isBoardMember(memberId) {
++  if (!memberId) return false;
++  try {
++    const result = await frappeGet(FRAPPE_METHODS.getBoardMembers);
++    const list = result?.board_members ?? [];
++    return list.some((b) => b?.member_id === memberId);
++  } catch (err) {
++    console.error("[frappe] board member lookup failed:", err.message);
++    return false;
++  }
++}
++
+ export function extractFrappeError(data) {
+   if (!data) return "";
+   if (typeof data.message === "string" && data.message.trim()) return data.message;
+diff --git a/lib/session.js b/lib/session.js
+index 2cb08a1..d653e08 100644
+--- a/lib/session.js
++++ b/lib/session.js
+@@ -4,6 +4,10 @@
+ // member — not even the member id — is readable or forgeable from browser
+ // JavaScript, and the Frappe API key/secret never leaves the server.
+ //
++// `isBoardMember` rides along in the same signed payload. It is decided once
++// at login rather than looked up on every request, and because the payload is
++// signed it cannot be flipped to true from devtools.
++//
+ // Requires SESSION_SECRET in .env.local (any long random string).
+ 
+ import crypto from "crypto";
+diff --git a/middleware.js b/middleware.js
+index 4200de6..e0e2a69 100644
+--- a/middleware.js
++++ b/middleware.js
+@@ -1,10 +1,13 @@
+ // middleware.js  (project root, next to package.json)
+ //
+-// Keeps /portal from flashing its shell to someone who isn't signed in.
+-// This is a cheap presence check only — middleware runs on the Edge runtime
+-// where Node's crypto isn't available, so the cookie's signature can't be
+-// verified here. Every API route still calls getSession(), which does verify
+-// it, so a forged cookie gets you an empty page and nothing else.
++// Keeps signed-out visitors off the member pages. This is a cheap presence
++// check only — middleware runs on the Edge runtime where Node's crypto isn't
++// available, so the cookie's signature can't be verified here. Every page and
++// API route behind it calls getSession(), which does verify it, so a forged
++// cookie gets you an empty page and nothing else.
++//
++// Board membership is NOT checked here — it lives inside the signed cookie
++// and is enforced in app/create-event/page.js and app/api/event/route.js.
+ 
+ import { NextResponse } from "next/server";
+ 
+@@ -14,7 +17,9 @@ export function middleware(request) {
+   const hasSession = Boolean(request.cookies.get(SESSION_COOKIE)?.value);
+   const { pathname } = request.nextUrl;
+ 
+-  if (pathname.startsWith("/portal") && !hasSession) {
++  const isProtected = pathname.startsWith("/portal") || pathname.startsWith("/create-event");
++
++  if (isProtected && !hasSession) {
+     const url = request.nextUrl.clone();
+     url.pathname = "/login";
+     return NextResponse.redirect(url);
+@@ -31,5 +36,5 @@ export function middleware(request) {
+ }
+ 
+ export const config = {
+-  matcher: ["/portal/:path*", "/login"],
++  matcher: ["/portal/:path*", "/create-event/:path*", "/login"],
+ };
+\ No newline at end of file

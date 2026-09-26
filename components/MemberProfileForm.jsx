@@ -3,37 +3,39 @@
 // and browser-only APIs (navigator.geolocation), so it must render on the
 // client, not the server.
 
+<<<<<<< HEAD
 import React, { useState, useCallback } from "react";
 import MapPicker from './MapPicker';
 import { withBase } from "@/lib/paths";
 
+=======
+import React, { useState, useCallback, useEffect, useRef } from "react";
+import MapPicker from "./MapPicker";
+import { useRouter } from "next/navigation";
+>>>>>>> fonts_bugs_clear
 
 /**
  * MemberProfileForm
  * ------------------
- * React conversion of the "Member Profile Form" wireframe.
+ * Personal, residence, business and family details for one member.
  *
- * WHAT'S WIRED UP:
- *  - All fields from the wireframe as controlled state
- *  - Conditional sections: Board designation, Wife's section (married),
- *    Wife's business (profession !== housewife), "Same as Husband" address copy
- *  - Member profession dropdown (Housewife / Business / Service):
- *      Business  -> shows the Business section
- *      Service   -> shows the Service section (Company, Sector, Designation)
- *      Housewife -> nothing extra
- *  - Children repeater (add / remove, capped at 4)
- *  - Geolocation capture button (📍 Use current location) for each address block
- *  - A MapPicker for the business address so members can drop/drag a pin
- *    instead of (or alongside) typing lat/lng manually
- *  - Basic required-field validation
- *  - Submit handler that POSTs to an API (multipart/form-data, so photo
- *    files travel with the rest of the payload)
+ * ON LOCATIONS
+ * Four addresses on this page can carry a pin: the member's home, their
+ * business, and the spouse's home and business. Rendering four 360px maps
+ * at once buried the form and made every one of them fetch its own tiles,
+ * so each map now sits behind a "Set location on map" button (see
+ * LocationField) and opens only when it is wanted. The status line and the
+ * "Use current location" shortcut stay visible either way.
  *
- * HOW TO WIRE THE SAVE API:
- *  Pass `apiEndpoint` (e.g. "/api/members") and optionally `authToken`.
- *  On submit, this component builds a FormData object and POSTs it.
- *  Adjust `buildFormData()` / `saveMember()` below to match your backend's
- *  exact field names if they differ.
+ * Coordinates are never displayed. Members see "Location set" or "No
+ * location set yet"; the numbers live in form state and travel with the
+ * save payload.
+ *
+ * ON RELATIVES
+ * The spouse and each child are separate member records on the backend, not
+ * fields on this one. Their `memberId` is carried invisibly through the form
+ * so the save route can update the right record — without it, everything
+ * typed into those sections was quietly discarded on save.
  */
 
 // Strips anything that isn't a digit and caps the length — used on every
@@ -42,6 +44,8 @@ import { withBase } from "@/lib/paths";
 const digitsOnly = (value, maxLen = 10) => value.replace(/\D/g, "").slice(0, maxLen);
 
 const emptyChild = () => ({
+  // Blank for a child who isn't on the backend yet.
+  memberId: "",
   name: "",
   dob: "",
   education: "",
@@ -64,12 +68,27 @@ const initialFormState = {
     isMarried: true,
     profession: "", // "" | "Housewife" | "Business" | "Service"
   },
+  // The member's own home. This is what the backend stores as home_address
+  // + area_location + city + pincode + residence_latitude/longitude — it is
+  // separate from any business address, and the form had no room for it
+  // before, so a saved home address could never be seen or edited here.
+  residence: {
+    address: "",
+    area: "",
+    city: "",
+    pinCode: "",
+    lat: "",
+    lng: "",
+  },
   service: {
     company: "",
     sector: "",
     designation: "",
   },
   business: {
+    // Carried so a save updates this business instead of filing a new one
+    // every time.
+    businessId: "",
     name: "",
     description: "",
     address1: "",
@@ -78,6 +97,7 @@ const initialFormState = {
     city: "",
     pinCode: "",
     natureOfBusiness: "",
+    subCategory: "",
     officePhone: "",
     email: "",
     website: "",
@@ -90,6 +110,8 @@ const initialFormState = {
     gotra: "",
   },
   wife: {
+    // The spouse's own member record id — needed to save anything here.
+    memberId: "",
     name: "",
     fatherName: "",
     profession: "",
@@ -110,6 +132,7 @@ const initialFormState = {
       lng: "",
     },
     business: {
+      businessId: "",
       name: "",
       description: "",
       sameAsHusband: false,
@@ -148,18 +171,43 @@ export default function MemberProfileForm({
   initialValues = null,
   onSaved = () => {},
 }) {
+  
   const [form, setForm] = useState(
     initialValues ? deepMerge(initialFormState, initialValues) : initialFormState
   );
   const [errors, setErrors] = useState({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
-  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [saveNotice, setSaveNotice] = useState("");
+  const router = useRouter();
+  // initialValues arrives after the first render (the portal fetches it) and
+  // again after every save. useState reads a prop once and never again, so
+  // without this the form kept showing whatever it was built with — which
+  // after a save meant stale or blank fields even though the server had the
+  // right data. The ref stops it looping on an identical payload.
+  const seededRef = useRef(null);
+  useEffect(() => {
+    if (!initialValues) return;
+    const stamp = JSON.stringify(initialValues);
+    if (seededRef.current === stamp) return;
+    seededRef.current = stamp;
+    setForm(deepMerge(initialFormState, initialValues));
+  }, [initialValues]);
+
+  // Banners sit at the top of a long page; without this the member presses
+  // Save at the bottom and sees nothing happen at all.
+  const scrollToTop = () => {
+    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   // ---- generic setters -----------------------------------------------
 
   const setMember = useCallback((patch) => {
     setForm((f) => ({ ...f, member: { ...f.member, ...patch } }));
+  }, []);
+
+  const setResidence = useCallback((patch) => {
+    setForm((f) => ({ ...f, residence: { ...f.residence, ...patch } }));
   }, []);
 
   const setBusiness = useCallback((patch) => {
@@ -208,17 +256,19 @@ export default function MemberProfileForm({
   }, []);
 
   // ---- "same as husband" address copy ---------------------------------
+  // Copies from the member's HOME, not their business — "same as husband"
+  // on a residence field means the same house.
 
   const toggleResidenceSameAsHusband = (checked) => {
     if (checked) {
       setWifeResidence({
         sameAsHusband: true,
-        address: form.business.address1,
-        area: form.business.area,
-        city: form.business.city,
-        pinCode: form.business.pinCode,
-        lat: form.business.lat,
-        lng: form.business.lng,
+        address: form.residence.address,
+        area: form.residence.area,
+        city: form.residence.city,
+        pinCode: form.residence.pinCode,
+        lat: form.residence.lat,
+        lng: form.residence.lng,
       });
     } else {
       setWifeResidence({ sameAsHusband: false });
@@ -242,12 +292,12 @@ export default function MemberProfileForm({
   };
 
   // ---- geolocation ------------------------------------------------------
-  // The "Use current location" button stays as a shortcut alongside the
-  // MapPicker below — either one calls the matching setter with { lat, lng }.
+
   const captureLocation = (setter, disabled) => {
     if (disabled) return;
     if (!navigator.geolocation) {
       setSaveError("Geolocation is not supported in this browser.");
+      scrollToTop();
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -259,6 +309,7 @@ export default function MemberProfileForm({
       },
       () => {
         setSaveError("Could not get current location (permission denied or unavailable).");
+        scrollToTop();
       },
       {
         // Without this, the browser often takes the fast path — resolving
@@ -292,6 +343,7 @@ export default function MemberProfileForm({
     reqMobile(form.member.mobile, "member.mobile");
     if (form.member.isInBoard) req(form.member.boardDesignation, "member.boardDesignation");
 
+    req(form.residence.address, "residence.address");
     req(form.member.profession, "member.profession");
 
     if (form.member.profession === "Business") {
@@ -335,6 +387,8 @@ export default function MemberProfileForm({
     fd.append("member", JSON.stringify(memberRest));
     if (photo) fd.append("memberPhoto", photo);
 
+    fd.append("residence", JSON.stringify(form.residence));
+
     // Only the section matching the chosen profession is sent.
     // (`profession` itself already travels inside the "member" JSON above.)
     if (form.member.profession === "Business") {
@@ -357,13 +411,39 @@ export default function MemberProfileForm({
     return fd;
   }
 
+  /**
+   * The member portal's endpoint takes JSON and already has the photos (they
+   * upload on their own as soon as they're picked), so files only need the
+   * multipart path used by the office's create-a-member route.
+   */
+  const usesJson = apiEndpoint.includes("/member/me");
+
   async function saveMember() {
+<<<<<<< HEAD
     const fd = buildFormData();
     const res = await fetch(withBase(apiEndpoint), {
+=======
+    const res = await fetch(apiEndpoint, {
+>>>>>>> fonts_bugs_clear
       method: "POST",
-      headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-      body: fd,
+      headers: usesJson
+        ? { "Content-Type": "application/json" }
+        : authToken
+        ? { Authorization: `Bearer ${authToken}` }
+        : undefined,
+      body: usesJson
+        ? JSON.stringify({
+            member: form.member,
+            residence: form.residence,
+            business: form.business,
+            service: form.service,
+            ancestry: form.ancestry,
+            wife: form.member.isMarried ? form.wife : null,
+            children: form.member.isMarried ? form.children : [],
+          })
+        : buildFormData(),
     });
+
     if (!res.ok) {
       let message = `Save failed (HTTP ${res.status})`;
       const raw = await res.text();
@@ -384,675 +464,723 @@ export default function MemberProfileForm({
 
   const handleSubmit = async () => {
     setSaveError("");
-    setSaveSuccess(false);
+    setSaveNotice("");
     if (!validate()) {
       setSaveError("Please fill in the required fields highlighted below.");
+      scrollToTop();
       return;
     }
     setSaving(true);
     try {
       const result = await saveMember();
-      setSaveSuccess(true);
+      // The portal route reports what it could and couldn't save — a child
+      // with no record yet, for instance. Showing its own message beats a
+      // blanket "saved" that quietly wasn't true for part of the form.
+      setSaveNotice(result?.message || "Saved successfully.");
+      scrollToTop();
       onSaved(result);
     } catch (err) {
       setSaveError(err.message || "Something went wrong while saving.");
+      scrollToTop();
     } finally {
       setSaving(false);
     }
   };
 
   const handleCancel = () => {
-    setForm(initialFormState);
+    setForm(initialValues ? deepMerge(initialFormState, initialValues) : initialFormState);
     setErrors({});
     setSaveError("");
-    setSaveSuccess(false);
+    setSaveNotice("");
+    scrollToTop();
   };
 
   return (
     <div className="mpf-outer">
       <div className="mpf-page">
-      <style>{css}</style>
+        <style>{css}</style>
 
-      <header className="mpf-doc-head">
-        <h1>Member profile form</h1>
-        <p>Save a member's full profile — personal, business and family details.</p>
-        <div className="mpf-legend">
-          <span className="mpf-req">*</span> indicates a mandatory field
-        </div>
-      </header>
+        <header className="mpf-doc-head">
+  <div className="mpf-doc-head-top">
+    <div>
+      <h1>Member profile form</h1>
+      <p>Save a member&apos;s full profile — personal, business and family details.</p>
+    </div>
+    <button
+      type="button"
+      className="mpf-create-event-btn"
+      onClick={() => router.push("/create-event")}
+    >
+      + Create Event
+    </button>
+  </div>
+  <div className="mpf-legend">
+    <span className="mpf-req">*</span> indicates a mandatory field
+  </div>
+</header>
 
-      {saveError && <div className="mpf-banner mpf-banner-error">{saveError}</div>}
-      {saveSuccess && <div className="mpf-banner mpf-banner-success">Member saved successfully.</div>}
+        {saveError && <div className="mpf-banner mpf-banner-error">{saveError}</div>}
+        {saveNotice && <div className="mpf-banner mpf-banner-success">{saveNotice}</div>}
 
-      {/* 1. Member details */}
-      <section className="mpf-card">
-        <h2>1. Member details</h2>
-        <div className="mpf-grid">
-          <Field label="Member's name" required error={errFor("member.name")}>
-            <input
-              type="text"
-              value={form.member.name}
-              onChange={(e) => setMember({ name: e.target.value })}
-            />
-          </Field>
-          <Field label="Husband's father's name" required error={errFor("member.husbandFatherName")}>
-            <input
-              type="text"
-              value={form.member.husbandFatherName}
-              onChange={(e) => setMember({ husbandFatherName: e.target.value })}
-            />
-          </Field>
-          <Field label="Surname" required error={errFor("member.surname")}>
-            <input
-              type="text"
-              value={form.member.surname}
-              onChange={(e) => setMember({ surname: e.target.value })}
-            />
-          </Field>
-          <DatePickerField
-            label="Date of birth"
-            required
-            error={errFor("member.dob")}
-            value={form.member.dob}
-            onChange={(v) => setMember({ dob: v })}
-          />
-          <Field label="Education">
-            <input
-              type="text"
-              value={form.member.education}
-              onChange={(e) => setMember({ education: e.target.value })}
-            />
-          </Field>
-          <Field label="Mobile number" required error={errFor("member.mobile")}>
-            <input
-              type="text"
-              inputMode="numeric"
-              maxLength={10}
-              value={form.member.mobile}
-              onChange={(e) => setMember({ mobile: digitsOnly(e.target.value) })}
-            />
-          </Field>
-          <Field label="Alternate mobile">
-            <input
-              type="text"
-              inputMode="numeric"
-              maxLength={10}
-              value={form.member.altMobile}
-              onChange={(e) => setMember({ altMobile: digitsOnly(e.target.value) })}
-            />
-          </Field>
-          <Field label="Individual photo">
-            <input
-              type="file"
-              accept="image/*"
-              onChange={(e) => setMember({ photo: e.target.files?.[0] || null })}
-            />
-          </Field>
-        </div>
-
-        <div className="mpf-grid" style={{ marginTop: 10 }}>
-          <Field label="Profession" required error={errFor("member.profession")}>
-            <select
-              value={form.member.profession}
-              onChange={(e) => setMember({ profession: e.target.value })}
-            >
-              <option value="">Select profession</option>
-              <option value="Housewife">Housewife</option>
-              <option value="Business">Business</option>
-              <option value="Service">Service</option>
-            </select>
-          </Field>
-        </div>
-
-        <label className="mpf-inline-toggle">
-          <input
-            type="checkbox"
-            checked={form.member.isInBoard}
-            onChange={(e) => setMember({ isInBoard: e.target.checked })}
-          />
-          Is in board
-        </label>
-        {form.member.isInBoard && (
-          <div className="mpf-grid" style={{ marginTop: 10 }}>
-            <Field label="Board designation" required error={errFor("member.boardDesignation")}>
-              <select
-                value={form.member.boardDesignation}
-                onChange={(e) => setMember({ boardDesignation: e.target.value })}
-              >
-                <option value="">Select designation</option>
-                <option value="Chairman & Managing Director">Chairman & Managing Director</option>
-                <option value="Directors">Directors</option>
-                <option value="Senior Director">Senior Director</option>
-                <option value="Secretary">Secretary</option>
-                <option value="Joint Secretary">Joint Secretary</option>
-                <option value="President">President</option>
-                <option value="Vice President">Vice President</option>
-                <option value="IPP - Immediate Past President">IPP - Immediate Past President</option>
-                <option value="Executive Director">Executive Director</option>
-                <option value="Treasurer">Treasurer</option>
-              </select>
-            </Field>
-          </div>
-        )}
-
-        <label className="mpf-inline-toggle">
-          <input
-            type="checkbox"
-            checked={form.member.isMarried}
-            onChange={(e) => setMember({ isMarried: e.target.checked })}
-          />
-          Married
-        </label>
-      </section>
-
-      {/* 2. Business — shown only when profession is Business */}
-      {form.member.profession === "Business" && (
-      <section className="mpf-card">
-        <h2>2. Business</h2>
-        <div className="mpf-grid">
-          <Field label="Business name" required full error={errFor("business.name")}>
-            <input
-              type="text"
-              value={form.business.name}
-              onChange={(e) => setBusiness({ name: e.target.value })}
-            />
-          </Field>
-          <Field label="Business description" full>
-            <input
-              type="text"
-              value={form.business.description}
-              onChange={(e) => setBusiness({ description: e.target.value })}
-            />
-          </Field>
-          <Field label="Office address 1" required error={errFor("business.address1")}>
-            <input
-              type="text"
-              value={form.business.address1}
-              onChange={(e) => setBusiness({ address1: e.target.value })}
-            />
-          </Field>
-          <Field label="Office address 2">
-            <input
-              type="text"
-              value={form.business.address2}
-              onChange={(e) => setBusiness({ address2: e.target.value })}
-            />
-          </Field>
-          <Field label="Area">
-            <input
-              type="text"
-              value={form.business.area}
-              onChange={(e) => setBusiness({ area: e.target.value })}
-            />
-          </Field>
-          <Field label="City" required error={errFor("business.city")}>
-            <input
-              type="text"
-              value={form.business.city}
-              onChange={(e) => setBusiness({ city: e.target.value })}
-            />
-          </Field>
-          <Field label="Pin code">
-            <input
-              type="text"
-              value={form.business.pinCode}
-              onChange={(e) => setBusiness({ pinCode: e.target.value })}
-            />
-          </Field>
-          <Field label="Nature of business">
-            <input
-              type="text"
-              value={form.business.natureOfBusiness}
-              onChange={(e) => setBusiness({ natureOfBusiness: e.target.value })}
-            />
-          </Field>
-          <Field label="Office phone">
-            <input
-              type="text"
-              inputMode="numeric"
-              maxLength={12}
-              value={form.business.officePhone}
-              onChange={(e) => setBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
-            />
-          </Field>
-          <Field label="Email ID">
-            <input
-              type="text"
-              value={form.business.email}
-              onChange={(e) => setBusiness({ email: e.target.value })}
-            />
-          </Field>
-          <Field label="Website" full>
-            <input
-              type="text"
-              value={form.business.website}
-              onChange={(e) => setBusiness({ website: e.target.value })}
-            />
-          </Field>
-
-          {/* Map picker — was accidentally left floating outside any
-              component earlier (referencing an undefined `business`
-              variable). Fixed: lives here in the Business section's JSX,
-              wired to form.business.lat/lng via setBusiness. */}
-          <div className="mpf-field-full">
-            <MapPicker
-              initialLat={form.business.lat}
-              initialLng={form.business.lng}
-              onLocationSelect={(lat, lng) => setBusiness({ lat, lng })}
-            />
-          </div>
-
-          <GeoRow
-            lat={form.business.lat}
-            lng={form.business.lng}
-            onUseCurrent={() => captureLocation(setBusiness, false)}
-          />
-          <p className="mpf-location-hint">
-            "Use current location" is approximate on laptops/desktops (no GPS chip) —
-            for an exact address, click or drag the pin on the map above instead.
-          </p>
-        </div>
-      </section>
-      )}
-
-      {/* 2. Service — shown only when profession is Service */}
-      {form.member.profession === "Service" && (
+        {/* 1. Member details */}
         <section className="mpf-card">
-          <h2>2. Service</h2>
-          <div className="mpf-grid mpf-cols-3">
-            <Field label="Company" required error={errFor("service.company")}>
-              <input
-                type="text"
-                value={form.service.company}
-                onChange={(e) => setService({ company: e.target.value })}
-              />
-            </Field>
-            <Field label="Sector">
-              <input
-                type="text"
-                value={form.service.sector}
-                onChange={(e) => setService({ sector: e.target.value })}
-              />
-            </Field>
-            <Field label="Designation" required error={errFor("service.designation")}>
-              <input
-                type="text"
-                value={form.service.designation}
-                onChange={(e) => setService({ designation: e.target.value })}
-              />
-            </Field>
-          </div>
-        </section>
-      )}
-
-      {/* 3. Ancestry */}
-      <section className="mpf-card">
-        <h2>3. Ancestry</h2>
-        <div className="mpf-grid mpf-cols-3">
-          <Field label="Ancestral place">
-            <input
-              type="text"
-              value={form.ancestry.place}
-              onChange={(e) => setAncestry({ place: e.target.value })}
-            />
-          </Field>
-          <Field label="Ancestral state">
-            <input
-              type="text"
-              value={form.ancestry.state}
-              onChange={(e) => setAncestry({ state: e.target.value })}
-            />
-          </Field>
-          <Field label="Gotra">
-            <input
-              type="text"
-              value={form.ancestry.gotra}
-              onChange={(e) => setAncestry({ gotra: e.target.value })}
-            />
-          </Field>
-        </div>
-      </section>
-
-      {/* 4. Wife's details */}
-      {form.member.isMarried && (
-        <section className="mpf-card">
-          <h2>
-            4. Wife's details <span className="mpf-toggle-hint">— shown only if member is married</span>
-          </h2>
-
-          <h3 className="mpf-sub">4a. Personal</h3>
+          <h2>1. Member details</h2>
           <div className="mpf-grid">
-            <Field label="Name" required error={errFor("wife.name")}>
+            <Field label="Member's name" required error={errFor("member.name")}>
               <input
                 type="text"
-                value={form.wife.name}
-                onChange={(e) => setWife({ name: e.target.value })}
+                value={form.member.name}
+                onChange={(e) => setMember({ name: e.target.value })}
               />
             </Field>
-            <Field label="Wife's father's name" required error={errFor("wife.fatherName")}>
+            <Field label="Husband's father's name" required error={errFor("member.husbandFatherName")}>
               <input
                 type="text"
-                value={form.wife.fatherName}
-                onChange={(e) => setWife({ fatherName: e.target.value })}
+                value={form.member.husbandFatherName}
+                onChange={(e) => setMember({ husbandFatherName: e.target.value })}
               />
             </Field>
-            <Field label="Profession">
-              <select
-                value={form.wife.profession}
-                onChange={(e) => setWife({ profession: e.target.value })}
-              >
-                <option value="">Select</option>
-                <option value="housewife">Housewife</option>
-                <option value="other">Other</option>
-              </select>
-            </Field>
-            <Field label="Mobile number" required error={errFor("wife.mobile")}>
+            <Field label="Surname" required error={errFor("member.surname")}>
               <input
                 type="text"
-                inputMode="numeric"
-                maxLength={10}
-                value={form.wife.mobile}
-                onChange={(e) => setWife({ mobile: digitsOnly(e.target.value) })}
-              />
-            </Field>
-            <Field label="Alternate contact">
-              <input
-                type="text"
-                inputMode="numeric"
-                maxLength={10}
-                value={form.wife.altContact}
-                onChange={(e) => setWife({ altContact: digitsOnly(e.target.value) })}
+                value={form.member.surname}
+                onChange={(e) => setMember({ surname: e.target.value })}
               />
             </Field>
             <DatePickerField
               label="Date of birth"
-              value={form.wife.dob}
-              onChange={(v) => setWife({ dob: v })}
+              required
+              error={errFor("member.dob")}
+              value={form.member.dob}
+              onChange={(v) => setMember({ dob: v })}
             />
             <Field label="Education">
               <input
                 type="text"
-                value={form.wife.education}
-                onChange={(e) => setWife({ education: e.target.value })}
+                value={form.member.education}
+                onChange={(e) => setMember({ education: e.target.value })}
               />
             </Field>
-            <Field label="Marriage anniversary">
+            <Field label="Mobile number" required error={errFor("member.mobile")}>
               <input
                 type="text"
-                value={form.wife.anniversary}
-                onChange={(e) => setWife({ anniversary: e.target.value })}
+                inputMode="numeric"
+                maxLength={10}
+                value={form.member.mobile}
+                onChange={(e) => setMember({ mobile: digitsOnly(e.target.value) })}
               />
             </Field>
-            <Field label="Wife's photo">
+            <Field label="Alternate mobile">
+              <input
+                type="text"
+                inputMode="numeric"
+                maxLength={10}
+                value={form.member.altMobile}
+                onChange={(e) => setMember({ altMobile: digitsOnly(e.target.value) })}
+              />
+            </Field>
+            <Field label="Individual photo">
               <input
                 type="file"
                 accept="image/*"
-                onChange={(e) => setWife({ photo: e.target.files?.[0] || null })}
-              />
-            </Field>
-            <Field label="Couple photo">
-              <input
-                type="file"
-                accept="image/*"
-                onChange={(e) => setWife({ couplePhoto: e.target.files?.[0] || null })}
+                onChange={(e) => setMember({ photo: e.target.files?.[0] || null })}
               />
             </Field>
           </div>
 
-          <h3 className="mpf-sub">4b. Residence</h3>
+          <div className="mpf-grid" style={{ marginTop: 10 }}>
+            <Field label="Profession" required error={errFor("member.profession")}>
+              <select
+                value={form.member.profession}
+                onChange={(e) => setMember({ profession: e.target.value })}
+              >
+                <option value="">Select profession</option>
+                <option value="Housewife">Housewife</option>
+                <option value="Business">Business</option>
+                <option value="Service">Service</option>
+              </select>
+            </Field>
+          </div>
+
+          <label className="mpf-inline-toggle">
+            <input
+              type="checkbox"
+              checked={form.member.isInBoard}
+              onChange={(e) => setMember({ isInBoard: e.target.checked })}
+            />
+            Is in board
+          </label>
+          {form.member.isInBoard && (
+            <div className="mpf-grid" style={{ marginTop: 10 }}>
+              <Field label="Board designation" required error={errFor("member.boardDesignation")}>
+                <select
+                  value={form.member.boardDesignation}
+                  onChange={(e) => setMember({ boardDesignation: e.target.value })}
+                >
+                  <option value="">Select designation</option>
+                  <option value="Chairman & Managing Director">Chairman &amp; Managing Director</option>
+                  <option value="Directors">Directors</option>
+                  <option value="Senior Director">Senior Director</option>
+                  <option value="Secretary">Secretary</option>
+                  <option value="Joint Secretary">Joint Secretary</option>
+                  <option value="President">President</option>
+                  <option value="Vice President">Vice President</option>
+                  <option value="IPP - Immediate Past President">IPP - Immediate Past President</option>
+                  <option value="Executive Director">Executive Director</option>
+                  <option value="Treasurer">Treasurer</option>
+                </select>
+              </Field>
+            </div>
+          )}
+
+          <label className="mpf-inline-toggle">
+            <input
+              type="checkbox"
+              checked={form.member.isMarried}
+              onChange={(e) => setMember({ isMarried: e.target.checked })}
+            />
+            Married
+          </label>
+        </section>
+
+        {/* 2. Residence — the member's own home */}
+        <section className="mpf-card">
+          <h2>2. Residence</h2>
           <div className="mpf-grid">
-            <Field label="Residence address" required full error={errFor("wife.residence.address")}>
-              <div className="mpf-address-row">
+            <Field label="Home address" required full error={errFor("residence.address")}>
+              <input
+                type="text"
+                value={form.residence.address}
+                onChange={(e) => setResidence({ address: e.target.value })}
+              />
+            </Field>
+            <Field label="Area">
+              <input
+                type="text"
+                value={form.residence.area}
+                onChange={(e) => setResidence({ area: e.target.value })}
+              />
+            </Field>
+            <Field label="City">
+              <input
+                type="text"
+                value={form.residence.city}
+                onChange={(e) => setResidence({ city: e.target.value })}
+              />
+            </Field>
+            <Field label="Pin code">
+              <input
+                type="text"
+                value={form.residence.pinCode}
+                onChange={(e) => setResidence({ pinCode: e.target.value })}
+              />
+            </Field>
+
+            <LocationField
+              label="Home location"
+              lat={form.residence.lat}
+              lng={form.residence.lng}
+              onSelect={(lat, lng) => setResidence({ lat, lng })}
+              onUseCurrent={() => captureLocation(setResidence, false)}
+            />
+          </div>
+        </section>
+
+        {/* 3. Business — shown only when profession is Business */}
+        {form.member.profession === "Business" && (
+          <section className="mpf-card">
+            <h2>3. Business</h2>
+            <div className="mpf-grid">
+              <Field label="Business name" required full error={errFor("business.name")}>
+                <input
+                  type="text"
+                  value={form.business.name}
+                  onChange={(e) => setBusiness({ name: e.target.value })}
+                />
+              </Field>
+              <Field label="Business description" full>
+                <input
+                  type="text"
+                  value={form.business.description}
+                  onChange={(e) => setBusiness({ description: e.target.value })}
+                />
+              </Field>
+              <Field label="Office address 1" required error={errFor("business.address1")}>
+                <input
+                  type="text"
+                  value={form.business.address1}
+                  onChange={(e) => setBusiness({ address1: e.target.value })}
+                />
+              </Field>
+              <Field label="Office address 2">
+                <input
+                  type="text"
+                  value={form.business.address2}
+                  onChange={(e) => setBusiness({ address2: e.target.value })}
+                />
+              </Field>
+              <Field label="Area">
+                <input
+                  type="text"
+                  value={form.business.area}
+                  onChange={(e) => setBusiness({ area: e.target.value })}
+                />
+              </Field>
+              <Field label="City" required error={errFor("business.city")}>
+                <input
+                  type="text"
+                  value={form.business.city}
+                  onChange={(e) => setBusiness({ city: e.target.value })}
+                />
+              </Field>
+              <Field label="Pin code">
+                <input
+                  type="text"
+                  value={form.business.pinCode}
+                  onChange={(e) => setBusiness({ pinCode: e.target.value })}
+                />
+              </Field>
+              <Field label="Nature of business">
+                <input
+                  type="text"
+                  value={form.business.natureOfBusiness}
+                  onChange={(e) => setBusiness({ natureOfBusiness: e.target.value })}
+                />
+              </Field>
+              <Field label="Sub category">
+                <input
+                  type="text"
+                  value={form.business.subCategory}
+                  onChange={(e) => setBusiness({ subCategory: e.target.value })}
+                />
+              </Field>
+              <Field label="Office phone">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={12}
+                  value={form.business.officePhone}
+                  onChange={(e) => setBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
+                />
+              </Field>
+              <Field label="Email ID">
+                <input
+                  type="text"
+                  value={form.business.email}
+                  onChange={(e) => setBusiness({ email: e.target.value })}
+                />
+              </Field>
+              <Field label="Website" full>
+                <input
+                  type="text"
+                  value={form.business.website}
+                  onChange={(e) => setBusiness({ website: e.target.value })}
+                />
+              </Field>
+
+              <LocationField
+                label="Business location"
+                lat={form.business.lat}
+                lng={form.business.lng}
+                onSelect={(lat, lng) => setBusiness({ lat, lng })}
+                onUseCurrent={() => captureLocation(setBusiness, false)}
+              />
+            </div>
+          </section>
+        )}
+
+        {/* 3. Service — shown only when profession is Service */}
+        {form.member.profession === "Service" && (
+          <section className="mpf-card">
+            <h2>3. Service</h2>
+            <div className="mpf-grid mpf-cols-3">
+              <Field label="Company" required error={errFor("service.company")}>
+                <input
+                  type="text"
+                  value={form.service.company}
+                  onChange={(e) => setService({ company: e.target.value })}
+                />
+              </Field>
+              <Field label="Sector">
+                <input
+                  type="text"
+                  value={form.service.sector}
+                  onChange={(e) => setService({ sector: e.target.value })}
+                />
+              </Field>
+              <Field label="Designation" required error={errFor("service.designation")}>
+                <input
+                  type="text"
+                  value={form.service.designation}
+                  onChange={(e) => setService({ designation: e.target.value })}
+                />
+              </Field>
+            </div>
+          </section>
+        )}
+
+        {/* 4. Ancestry */}
+        <section className="mpf-card">
+          <h2>4. Ancestry</h2>
+          <div className="mpf-grid mpf-cols-3">
+            <Field label="Ancestral place">
+              <input
+                type="text"
+                value={form.ancestry.place}
+                onChange={(e) => setAncestry({ place: e.target.value })}
+              />
+            </Field>
+            <Field label="Ancestral state">
+              <input
+                type="text"
+                value={form.ancestry.state}
+                onChange={(e) => setAncestry({ state: e.target.value })}
+              />
+            </Field>
+            <Field label="Gotra">
+              <input
+                type="text"
+                value={form.ancestry.gotra}
+                onChange={(e) => setAncestry({ gotra: e.target.value })}
+              />
+            </Field>
+          </div>
+        </section>
+
+        {/* 5. Wife's details */}
+        {form.member.isMarried && (
+          <section className="mpf-card">
+            <h2>
+              5. Wife&apos;s details{" "}
+              <span className="mpf-toggle-hint">
+                {form.wife.memberId
+                  ? "— shown only if member is married"
+                  : "— no linked record yet, so changes here cannot be saved"}
+              </span>
+            </h2>
+
+            <h3 className="mpf-sub">5a. Personal</h3>
+            <div className="mpf-grid">
+              <Field label="Name" required error={errFor("wife.name")}>
+                <input
+                  type="text"
+                  value={form.wife.name}
+                  onChange={(e) => setWife({ name: e.target.value })}
+                />
+              </Field>
+              <Field label="Wife's father's name" required error={errFor("wife.fatherName")}>
+                <input
+                  type="text"
+                  value={form.wife.fatherName}
+                  onChange={(e) => setWife({ fatherName: e.target.value })}
+                />
+              </Field>
+              <Field label="Profession">
+                <select
+                  value={form.wife.profession}
+                  onChange={(e) => setWife({ profession: e.target.value })}
+                >
+                  <option value="">Select</option>
+                  <option value="housewife">Housewife</option>
+                  <option value="other">Other</option>
+                </select>
+              </Field>
+              <Field label="Mobile number" required error={errFor("wife.mobile")}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={10}
+                  value={form.wife.mobile}
+                  onChange={(e) => setWife({ mobile: digitsOnly(e.target.value) })}
+                />
+              </Field>
+              <Field label="Alternate contact">
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  maxLength={10}
+                  value={form.wife.altContact}
+                  onChange={(e) => setWife({ altContact: digitsOnly(e.target.value) })}
+                />
+              </Field>
+              <DatePickerField
+                label="Date of birth"
+                value={form.wife.dob}
+                onChange={(v) => setWife({ dob: v })}
+              />
+              <Field label="Education">
+                <input
+                  type="text"
+                  value={form.wife.education}
+                  onChange={(e) => setWife({ education: e.target.value })}
+                />
+              </Field>
+              <DatePickerField
+                label="Marriage anniversary"
+                value={form.wife.anniversary}
+                onChange={(v) => setWife({ anniversary: v })}
+              />
+              <Field label="Wife's photo">
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => setWife({ photo: e.target.files?.[0] || null })}
+                />
+              </Field>
+              <Field label="Couple photo">
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => setWife({ couplePhoto: e.target.files?.[0] || null })}
+                />
+              </Field>
+            </div>
+
+            <h3 className="mpf-sub">5b. Residence</h3>
+            <div className="mpf-grid">
+              <Field label="Residence address" required full error={errFor("wife.residence.address")}>
+                <div className="mpf-address-row">
+                  <input
+                    type="text"
+                    disabled={form.wife.residence.sameAsHusband}
+                    value={form.wife.residence.address}
+                    onChange={(e) => setWifeResidence({ address: e.target.value })}
+                  />
+                  <label className="mpf-same-as">
+                    <input
+                      type="checkbox"
+                      checked={form.wife.residence.sameAsHusband}
+                      onChange={(e) => toggleResidenceSameAsHusband(e.target.checked)}
+                    />
+                    Same as Husband
+                  </label>
+                </div>
+              </Field>
+              <Field label="Residence area">
                 <input
                   type="text"
                   disabled={form.wife.residence.sameAsHusband}
-                  value={form.wife.residence.address}
-                  onChange={(e) => setWifeResidence({ address: e.target.value })}
+                  value={form.wife.residence.area}
+                  onChange={(e) => setWifeResidence({ area: e.target.value })}
                 />
-                <label className="mpf-same-as">
-                  <input
-                    type="checkbox"
-                    checked={form.wife.residence.sameAsHusband}
-                    onChange={(e) => toggleResidenceSameAsHusband(e.target.checked)}
-                  />
-                  Same as Husband
-                </label>
-              </div>
-            </Field>
-            <Field label="Residence area">
-              <input
-                type="text"
-                disabled={form.wife.residence.sameAsHusband}
-                value={form.wife.residence.area}
-                onChange={(e) => setWifeResidence({ area: e.target.value })}
-              />
-            </Field>
-            <Field label="Residence city">
-              <input
-                type="text"
-                disabled={form.wife.residence.sameAsHusband}
-                value={form.wife.residence.city}
-                onChange={(e) => setWifeResidence({ city: e.target.value })}
-              />
-            </Field>
-            <Field label="Residence pin code">
-              <input
-                type="text"
-                disabled={form.wife.residence.sameAsHusband}
-                value={form.wife.residence.pinCode}
-                onChange={(e) => setWifeResidence({ pinCode: e.target.value })}
-              />
-            </Field>
-
-            {!form.wife.residence.sameAsHusband && (
-              <div className="mpf-field-full">
-                <MapPicker
-                  initialLat={form.wife.residence.lat}
-                  initialLng={form.wife.residence.lng}
-                  onLocationSelect={(lat, lng) => setWifeResidence({ lat, lng })}
+              </Field>
+              <Field label="Residence city">
+                <input
+                  type="text"
+                  disabled={form.wife.residence.sameAsHusband}
+                  value={form.wife.residence.city}
+                  onChange={(e) => setWifeResidence({ city: e.target.value })}
                 />
-              </div>
-            )}
+              </Field>
+              <Field label="Residence pin code">
+                <input
+                  type="text"
+                  disabled={form.wife.residence.sameAsHusband}
+                  value={form.wife.residence.pinCode}
+                  onChange={(e) => setWifeResidence({ pinCode: e.target.value })}
+                />
+              </Field>
 
-            <GeoRow
-              lat={form.wife.residence.lat}
-              lng={form.wife.residence.lng}
-              disabled={form.wife.residence.sameAsHusband}
-              onUseCurrent={() => captureLocation(setWifeResidence, form.wife.residence.sameAsHusband)}
-            />
-          </div>
+              <LocationField
+                label="Residence location"
+                lat={form.wife.residence.lat}
+                lng={form.wife.residence.lng}
+                disabled={form.wife.residence.sameAsHusband}
+                onSelect={(lat, lng) => setWifeResidence({ lat, lng })}
+                onUseCurrent={() => captureLocation(setWifeResidence, form.wife.residence.sameAsHusband)}
+              />
+            </div>
 
-          {form.wife.profession && form.wife.profession !== "housewife" && (
-            <>
-              <h3 className="mpf-sub">
-                4c. Business <span className="mpf-toggle-hint">— shown only if profession is not Housewife</span>
-              </h3>
-              <div className="mpf-grid">
-                <Field label="Business name" full>
-                  <input
-                    type="text"
-                    value={form.wife.business.name}
-                    onChange={(e) => setWifeBusiness({ name: e.target.value })}
-                  />
-                </Field>
-                <Field label="Business description" full>
-                  <input
-                    type="text"
-                    value={form.wife.business.description}
-                    onChange={(e) => setWifeBusiness({ description: e.target.value })}
-                  />
-                </Field>
+            {form.wife.profession && form.wife.profession !== "housewife" && (
+              <>
+                <h3 className="mpf-sub">
+                  5c. Business <span className="mpf-toggle-hint">— shown only if profession is not Housewife</span>
+                </h3>
+                <div className="mpf-grid">
+                  <Field label="Business name" full>
+                    <input
+                      type="text"
+                      value={form.wife.business.name}
+                      onChange={(e) => setWifeBusiness({ name: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Business description" full>
+                    <input
+                      type="text"
+                      value={form.wife.business.description}
+                      onChange={(e) => setWifeBusiness({ description: e.target.value })}
+                    />
+                  </Field>
 
-                <Field label="Office address" required full error={errFor("wife.business.address")}>
-                  <div className="mpf-address-row">
+                  <Field label="Office address" required full error={errFor("wife.business.address")}>
+                    <div className="mpf-address-row">
+                      <input
+                        type="text"
+                        disabled={form.wife.business.sameAsHusband}
+                        value={form.wife.business.address}
+                        onChange={(e) => setWifeBusiness({ address: e.target.value })}
+                      />
+                      <label className="mpf-same-as">
+                        <input
+                          type="checkbox"
+                          checked={form.wife.business.sameAsHusband}
+                          onChange={(e) => toggleWifeBusinessSameAsHusband(e.target.checked)}
+                        />
+                        Same as Husband
+                      </label>
+                    </div>
+                  </Field>
+
+                  <Field label="Area">
                     <input
                       type="text"
                       disabled={form.wife.business.sameAsHusband}
-                      value={form.wife.business.address}
-                      onChange={(e) => setWifeBusiness({ address: e.target.value })}
+                      value={form.wife.business.area}
+                      onChange={(e) => setWifeBusiness({ area: e.target.value })}
                     />
-                    <label className="mpf-same-as">
-                      <input
-                        type="checkbox"
-                        checked={form.wife.business.sameAsHusband}
-                        onChange={(e) => toggleWifeBusinessSameAsHusband(e.target.checked)}
-                      />
-                      Same as Husband
-                    </label>
-                  </div>
-                </Field>
-
-                <Field label="Area">
-                  <input
-                    type="text"
-                    disabled={form.wife.business.sameAsHusband}
-                    value={form.wife.business.area}
-                    onChange={(e) => setWifeBusiness({ area: e.target.value })}
-                  />
-                </Field>
-                <Field label="City">
-                  <input
-                    type="text"
-                    disabled={form.wife.business.sameAsHusband}
-                    value={form.wife.business.city}
-                    onChange={(e) => setWifeBusiness({ city: e.target.value })}
-                  />
-                </Field>
-                <Field label="Pin code">
-                  <input
-                    type="text"
-                    disabled={form.wife.business.sameAsHusband}
-                    value={form.wife.business.pinCode}
-                    onChange={(e) => setWifeBusiness({ pinCode: e.target.value })}
-                  />
-                </Field>
-                <Field label="Nature of business">
-                  <input
-                    type="text"
-                    value={form.wife.business.natureOfBusiness}
-                    onChange={(e) => setWifeBusiness({ natureOfBusiness: e.target.value })}
-                  />
-                </Field>
-                <Field label="Office phone">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={12}
-                    value={form.wife.business.officePhone}
-                    onChange={(e) => setWifeBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
-                  />
-                </Field>
-                <Field label="Email ID">
-                  <input
-                    type="text"
-                    value={form.wife.business.email}
-                    onChange={(e) => setWifeBusiness({ email: e.target.value })}
-                  />
-                </Field>
-                <Field label="Website" full>
-                  <input
-                    type="text"
-                    value={form.wife.business.website}
-                    onChange={(e) => setWifeBusiness({ website: e.target.value })}
-                  />
-                </Field>
-
-                {!form.wife.business.sameAsHusband && (
-                  <div className="mpf-field-full">
-                    <MapPicker
-                      initialLat={form.wife.business.lat}
-                      initialLng={form.wife.business.lng}
-                      onLocationSelect={(lat, lng) => setWifeBusiness({ lat, lng })}
+                  </Field>
+                  <Field label="City">
+                    <input
+                      type="text"
+                      disabled={form.wife.business.sameAsHusband}
+                      value={form.wife.business.city}
+                      onChange={(e) => setWifeBusiness({ city: e.target.value })}
                     />
-                  </div>
-                )}
+                  </Field>
+                  <Field label="Pin code">
+                    <input
+                      type="text"
+                      disabled={form.wife.business.sameAsHusband}
+                      value={form.wife.business.pinCode}
+                      onChange={(e) => setWifeBusiness({ pinCode: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Nature of business">
+                    <input
+                      type="text"
+                      value={form.wife.business.natureOfBusiness}
+                      onChange={(e) => setWifeBusiness({ natureOfBusiness: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Office phone">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={12}
+                      value={form.wife.business.officePhone}
+                      onChange={(e) => setWifeBusiness({ officePhone: digitsOnly(e.target.value, 12) })}
+                    />
+                  </Field>
+                  <Field label="Email ID">
+                    <input
+                      type="text"
+                      value={form.wife.business.email}
+                      onChange={(e) => setWifeBusiness({ email: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Website" full>
+                    <input
+                      type="text"
+                      value={form.wife.business.website}
+                      onChange={(e) => setWifeBusiness({ website: e.target.value })}
+                    />
+                  </Field>
 
-                <GeoRow
-                  lat={form.wife.business.lat}
-                  lng={form.wife.business.lng}
-                  disabled={form.wife.business.sameAsHusband}
-                  onUseCurrent={() => captureLocation(setWifeBusiness, form.wife.business.sameAsHusband)}
-                />
-              </div>
-            </>
-          )}
-        </section>
-      )}
+                  <LocationField
+                    label="Business location"
+                    lat={form.wife.business.lat}
+                    lng={form.wife.business.lng}
+                    disabled={form.wife.business.sameAsHusband}
+                    onSelect={(lat, lng) => setWifeBusiness({ lat, lng })}
+                    onUseCurrent={() => captureLocation(setWifeBusiness, form.wife.business.sameAsHusband)}
+                  />
+                </div>
+              </>
+            )}
+          </section>
+        )}
 
-      {/* 5. Children */}
-      {form.member.isMarried && (
-        <section className="mpf-card">
-          <h2>
-            5. Children <span className="mpf-toggle-hint">— shown only if member is married</span>
-          </h2>
-          <div className="mpf-note">Same field set repeats per child, up to 4</div>
-
-          {form.children.map((child, i) => (
-            <div className="mpf-repeat-block" key={i}>
-              <div className="mpf-repeat-label-row">
-                <span className="mpf-repeat-label">Child {i + 1}</span>
-                {form.children.length > 1 && (
-                  <button type="button" className="mpf-remove" onClick={() => removeChild(i)}>
-                    Remove
-                  </button>
-                )}
-              </div>
-              <div className="mpf-grid">
-                <Field label="Name" required error={errFor(`children.${i}.name`)}>
-                  <input
-                    type="text"
-                    value={child.name}
-                    onChange={(e) => setChild(i, { name: e.target.value })}
-                  />
-                </Field>
-                <DatePickerField
-                  label="Date of birth"
-                  value={child.dob}
-                  onChange={(v) => setChild(i, { dob: v })}
-                />
-                <Field label="Education">
-                  <input
-                    type="text"
-                    value={child.education}
-                    onChange={(e) => setChild(i, { education: e.target.value })}
-                  />
-                </Field>
-                <Field label="Mobile number">
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    maxLength={10}
-                    value={child.mobile}
-                    onChange={(e) => setChild(i, { mobile: digitsOnly(e.target.value) })}
-                  />
-                </Field>
-                <Field label="Additional info" full>
-                  <input
-                    type="text"
-                    value={child.additionalInfo}
-                    onChange={(e) => setChild(i, { additionalInfo: e.target.value })}
-                  />
-                </Field>
-              </div>
+        {/* 6. Children */}
+        {form.member.isMarried && (
+          <section className="mpf-card">
+            <h2>
+              6. Children <span className="mpf-toggle-hint">— shown only if member is married</span>
+            </h2>
+            <div className="mpf-note">
+              Same field set repeats per child, up to 4. Children already on the record can be
+              edited here; a brand-new child has to be added by the club office, because each
+              child is a member record of their own.
             </div>
-          ))}
 
-          {form.children.length < 4 && (
-            <button type="button" className="mpf-ghost" onClick={addChild}>
-              + Add another child
-            </button>
-          )}
-        </section>
-      )}
+            {form.children.map((child, i) => (
+              <div className="mpf-repeat-block" key={child.memberId || i}>
+                <div className="mpf-repeat-label-row">
+                  <span className="mpf-repeat-label">
+                    Child {i + 1}
+                    {!child.memberId && child.name ? " — not yet on record" : ""}
+                  </span>
+                  {form.children.length > 1 && (
+                    <button type="button" className="mpf-remove" onClick={() => removeChild(i)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <div className="mpf-grid">
+                  <Field label="Name" required error={errFor(`children.${i}.name`)}>
+                    <input
+                      type="text"
+                      value={child.name}
+                      onChange={(e) => setChild(i, { name: e.target.value })}
+                    />
+                  </Field>
+                  <DatePickerField
+                    label="Date of birth"
+                    value={child.dob}
+                    onChange={(v) => setChild(i, { dob: v })}
+                  />
+                  <Field label="Education">
+                    <input
+                      type="text"
+                      value={child.education}
+                      onChange={(e) => setChild(i, { education: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="Mobile number">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={10}
+                      value={child.mobile}
+                      onChange={(e) => setChild(i, { mobile: digitsOnly(e.target.value) })}
+                    />
+                  </Field>
+                  <Field label="Additional info" full>
+                    <input
+                      type="text"
+                      value={child.additionalInfo}
+                      onChange={(e) => setChild(i, { additionalInfo: e.target.value })}
+                    />
+                  </Field>
+                </div>
+              </div>
+            ))}
 
-      <div className="mpf-actions">
-        <button type="button" className="mpf-cancel" onClick={handleCancel} disabled={saving}>
-          Cancel
-        </button>
-        <button type="button" className="mpf-save" onClick={handleSubmit} disabled={saving}>
-          {saving ? "Saving…" : "Save member"}
-        </button>
-      </div>
+            {form.children.length < 4 && (
+              <button type="button" className="mpf-ghost" onClick={addChild}>
+                + Add another child
+              </button>
+            )}
+          </section>
+        )}
+
+        <div className="mpf-actions">
+          <button type="button" className="mpf-cancel" onClick={handleCancel} disabled={saving}>
+            Cancel
+          </button>
+          <button type="button" className="mpf-save" onClick={handleSubmit} disabled={saving}>
+            {saving ? "Saving…" : "Save"}
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -1079,25 +1207,56 @@ function Field({ label, required, full, error, children }) {
   );
 }
 
-// Deliberately does NOT render the raw lat/lng numbers — the member only
-// ever sees a status ("Location set" / "No location set") and picks the
-// spot visually (map pin or this button). The actual coordinates still
-// live in form state exactly as before and travel to the backend via the
-// normal save payload (buildFormData/saveMember) — they're just never
-// shown on screen.
-function GeoRow({ lat, lng, disabled, onUseCurrent }) {
+/**
+ * Status line, a "Use current location" shortcut, and a map that stays shut
+ * until asked for.
+ *
+ * Four of these appear on a full profile. Rendering every map immediately
+ * turned the page into a wall of tiles and made each one fetch its own
+ * imagery on load, so the map is mounted only once the button is pressed —
+ * which also means a member who never touches locations never pays for a
+ * single map.
+ *
+ * The coordinates themselves are deliberately never rendered. They live in
+ * form state and travel with the save payload.
+ */
+function LocationField({ label = "Location", lat, lng, disabled, onSelect, onUseCurrent }) {
+  const [open, setOpen] = useState(false);
   const hasLocation = !!(lat && lng);
+
   return (
-    <div className="mpf-geo-row">
-      <div className="mpf-geo-status">
-        <span className={"mpf-geo-dot" + (hasLocation ? " mpf-geo-dot-set" : "")} aria-hidden="true" />
-        <span className="mpf-geo-status-text">
-          {hasLocation ? "📍 Location set" : "No location set yet"}
-        </span>
+    <div className="mpf-loc">
+      <div className="mpf-geo-row">
+        <div className="mpf-geo-status">
+          <span className={"mpf-geo-dot" + (hasLocation ? " mpf-geo-dot-set" : "")} aria-hidden="true" />
+          <span className="mpf-geo-status-text">
+            {label}: {hasLocation ? "📍 set" : "not set yet"}
+          </span>
+        </div>
+        <div className="mpf-geo-actions">
+          <button
+            type="button"
+            className="mpf-geo-btn"
+            disabled={disabled}
+            onClick={() => setOpen((o) => !o)}
+          >
+            {open ? "Hide map" : hasLocation ? "Change on map" : "Set on map"}
+          </button>
+          <button type="button" className="mpf-geo-btn" disabled={disabled} onClick={onUseCurrent}>
+            Use current location
+          </button>
+        </div>
       </div>
-      <button type="button" className="mpf-geo-btn" disabled={disabled} onClick={onUseCurrent}>
-        Use current location
-      </button>
+
+      {open && !disabled && (
+        <div className="mpf-loc-map">
+          <MapPicker initialLat={lat} initialLng={lng} onLocationSelect={onSelect} />
+          <p className="mpf-location-hint">
+            &quot;Use current location&quot; is approximate on laptops (no GPS chip) —
+            for an exact spot, click or drag the pin.
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -1143,9 +1302,9 @@ function DatePickerField({ label, value, onChange, required, error }) {
   const parsed = value ? new Date(value) : null;
   const [viewYear, setViewYear] = useState((parsed && !isNaN(parsed)) ? parsed.getFullYear() : today.getFullYear());
   const [viewMonth, setViewMonth] = useState((parsed && !isNaN(parsed)) ? parsed.getMonth() : today.getMonth());
-  const wrapRef = React.useRef(null);
+  const wrapRef = useRef(null);
 
-  React.useEffect(() => {
+  useEffect(() => {
     function onOutside(e) {
       if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
     }
@@ -1225,14 +1384,9 @@ function DatePickerField({ label, value, onChange, required, error }) {
   );
 }
 
-// ---- styles (ported from the wireframe) -------------------------------
+// ---- styles -----------------------------------------------------------
 
 const css = `
-  /* Full-width wrapper: carries the background and fills the whole
-     viewport edge-to-edge, so there's no black/blank strip on either
-     side on wide laptop screens. The actual card content still sits in
-     a max-width column below — this only changes the empty space around
-     it, NOT the 2-column field grid, which stays exactly as it was. */
   .mpf-outer {
     --border: #B9B6AC;
     --border-light: #D8D5CB;
@@ -1242,7 +1396,6 @@ const css = `
     --text-muted: #7A776E;
     --accent: #B3413A;
     width: 100%;
-    min-height: 100vh;
     background: var(--surface);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
@@ -1284,8 +1437,6 @@ const css = `
   .mpf-grid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px 16px; margin-top: 12px; }
   .mpf-cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); }
 
-  /* Responsive: 4 columns is a laptop/desktop layout. Step down as the
-     viewport shrinks so fields never get squeezed unreadably narrow. */
   @media (max-width: 900px) {
     .mpf-grid, .mpf-cols-3 { grid-template-columns: repeat(2, minmax(0,1fr)); }
   }
@@ -1311,22 +1462,51 @@ const css = `
     border-width: 1.5px !important;
     background: #FDF3F2;
   }
+    .mpf-doc-head-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.mpf-create-event-btn {
+  height: 36px;
+  padding: 0 16px;
+  border-radius: 6px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mpf-create-event-btn:hover { opacity: 0.9; }
 
   .mpf-address-row { display: flex; align-items: flex-end; gap: 10px; }
-  .mpf-address-row .mpf-field { flex: 1; }
+  .mpf-address-row input { flex: 1; }
   .mpf-same-as { display: flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; white-space: nowrap; font-size: 12.5px; color: var(--text); }
   .mpf-same-as input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--accent); }
 
-  .mpf-geo-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; grid-column: 1 / -1; }
+  /* Collapsible location block */
+  .mpf-loc { grid-column: 1 / -1; margin-top: 4px; }
+  .mpf-loc-map { margin-top: 10px; }
+  .mpf-geo-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+    background: #F7F6F2; border: 1px solid var(--border-light);
+    border-radius: 8px; padding: 10px 12px;
+  }
   .mpf-geo-status { display: flex; align-items: center; gap: 8px; }
   .mpf-geo-dot { width: 8px; height: 8px; border-radius: 4px; background: var(--border); flex-shrink: 0; }
   .mpf-geo-dot-set { background: #2E6B3E; }
   .mpf-geo-status-text { font-size: 12.5px; color: var(--text-muted); }
-  .mpf-geo-btn { height: 34px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap; }
+  .mpf-geo-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .mpf-geo-btn { height: 32px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); font-size: 12px; color: var(--text); cursor: pointer; white-space: nowrap; }
   .mpf-geo-btn:disabled { color: var(--text-muted); cursor: not-allowed; }
 
   .mpf-note { font-size: 12px; color: var(--text-muted); margin-top: 10px; font-style: italic; }
-  .mpf-location-hint { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-muted); margin: 6px 0 0; font-style: italic; }
+  .mpf-location-hint { font-size: 11.5px; color: var(--text-muted); margin: 6px 0 0; font-style: italic; }
 
   .mpf-repeat-block { border: 1px dashed var(--border); border-radius: 8px; padding: 14px 16px; margin-top: 8px; }
   .mpf-repeat-label-row { display: flex; align-items: center; justify-content: space-between; }
@@ -1340,8 +1520,6 @@ const css = `
   .mpf-save { background: var(--text); color: #fff; font-weight: 600; }
   .mpf-actions button:disabled { opacity: 0.6; cursor: not-allowed; }
 
-  /* Custom date picker (replaces the native <input type="date">, whose
-     calendar icon doesn't render visibly in every browser/zoom setup) */
   .mpf-date-trigger {
     height: 34px; width: 100%; border: 1px solid var(--border); border-radius: 6px;
     padding: 0 10px; background: var(--card); font-size: 13px; cursor: pointer;

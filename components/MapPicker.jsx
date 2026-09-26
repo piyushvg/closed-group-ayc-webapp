@@ -11,8 +11,7 @@ import { useEffect, useId, useRef, useState } from "react";
 // (geocoding/routing), and must never be shipped to the browser.
 const MAPPLS_KEY = process.env.NEXT_PUBLIC_MAPPLS_ACCESS_TOKEN;
 
-// Default centre: Nagpur (Ring Road / Sitabuldi / Itwari areas used
-// elsewhere in the app). Change if the club is based elsewhere.
+// Default centre: Nagpur.
 const DEFAULT_LAT = 21.1458;
 const DEFAULT_LNG = 79.0882;
 
@@ -45,21 +44,16 @@ function waitForContainer(id, attemptsLeft = 30) {
  * Renders an interactive Mappls map. Click anywhere (or drag the marker)
  * to set a location — calls onLocationSelect(lat, lng) every time it changes.
  *
- * Usage:
- *   <MapPicker
- *     initialLat={business.lat}
- *     initialLng={business.lng}
- *     onLocationSelect={(lat, lng) => {
- *       setBusiness((b) => ({ ...b, lat, lng }));
- *     }}
- *   />
+ * The coordinates are never displayed by this component; whoever uses it
+ * decides what to show. Both the member profile and the event form show a
+ * status line rather than the numbers.
  */
 export default function MapPicker({ initialLat, initialLng, onLocationSelect }) {
   const mapDivRef = useRef(null);
   const mapRef = useRef(null);
   const markerRef = useRef(null);
   const [loaded, setLoaded] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState("");
 
   // Mappls' Map() constructor wants the container's id *string*, not a DOM
   // element reference — passing the element itself silently fails with
@@ -69,11 +63,16 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect }) 
   // context, so they're swapped for dashes.
   const containerId = `mappls-map-${useId().replace(/:/g, "-")}`;
 
-  const lat = initialLat ?? DEFAULT_LAT;
-  const lng = initialLng ?? DEFAULT_LNG;
+  const lat = Number(initialLat) || DEFAULT_LAT;
+  const lng = Number(initialLng) || DEFAULT_LNG;
 
   useEffect(() => {
     let cancelled = false;
+
+    if (!MAPPLS_KEY) {
+      setError("NEXT_PUBLIC_MAPPLS_ACCESS_TOKEN is not set in .env.local");
+      return;
+    }
 
     async function initMap() {
       if (cancelled || !window.mappls) return;
@@ -81,39 +80,47 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect }) 
       try {
         await waitForContainer(containerId);
       } catch (e) {
-        if (!cancelled) setError(true);
+        if (!cancelled) setError(e.message);
         return;
       }
       if (cancelled) return;
 
-      const map = new window.mappls.Map(containerId, {
-        center: [lat, lng],
-        zoom: 15,
-      });
-      mapRef.current = map;
-
-      map.on("load", () => {
-        if (cancelled) return;
-
-        const marker = new window.mappls.Marker({
-          map,
-          position: { lat, lng },
-          draggable: true,
+      try {
+        const map = new window.mappls.Map(containerId, {
+          center: [lat, lng],
+          zoom: 15,
         });
-        markerRef.current = marker;
-        setLoaded(true);
+        mapRef.current = map;
 
-        map.on("click", (e) => {
-          const pos = { lat: e.lnglat.lat, lng: e.lnglat.lng };
-          marker.setPosition(pos);
-          onLocationSelect?.(pos.lat, pos.lng);
-        });
+        map.on("load", () => {
+          if (cancelled) return;
 
-        marker.addListener("dragend", () => {
-          const pos = marker.getPosition();
-          onLocationSelect?.(pos.lat, pos.lng);
+          const marker = new window.mappls.Marker({
+            map,
+            position: { lat, lng },
+            draggable: true,
+          });
+          markerRef.current = marker;
+          setLoaded(true);
+
+          map.on("click", (e) => {
+            // Different SDK builds spell this differently; a wrong guess
+            // here throws inside the handler and the pin simply never moves.
+            const ll = e.lngLat || e.lnglat || e.latlng;
+            if (!ll) return;
+            const pos = { lat: ll.lat, lng: ll.lng };
+            marker.setPosition(pos);
+            onLocationSelect?.(pos.lat, pos.lng);
+          });
+
+          marker.addListener("dragend", () => {
+            const pos = marker.getPosition();
+            onLocationSelect?.(pos.lat, pos.lng);
+          });
         });
-      });
+      } catch (e) {
+        if (!cancelled) setError(e?.message || "Mappls failed to initialise");
+      }
     }
 
     if (window.mappls) {
@@ -128,7 +135,8 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect }) 
         script.src = `https://apis.mappls.com/advancedmaps/api/${MAPPLS_KEY}/map_sdk?layer=vector&v=3.0`;
         script.async = true;
         script.onload = initMap;
-        script.onerror = () => setError(true);
+        script.onerror = () =>
+          setError("Mappls SDK script failed to load — check the key and its domain restrictions.");
         document.head.appendChild(script);
       }
     }
@@ -152,11 +160,12 @@ export default function MapPicker({ initialLat, initialLng, onLocationSelect }) 
       )}
       {error && (
         <div style={{
-          position: "absolute", inset: 0, display: "flex",
+          position: "absolute", inset: 0, display: "flex", flexDirection: "column", gap: 6,
           alignItems: "center", justifyContent: "center",
           background: "#f5f3ef", color: "#d9534f", fontSize: 13, textAlign: "center", padding: 16,
         }}>
-          Could not load the map. Check the Mappls key.
+          <strong>Could not load the map.</strong>
+          <span style={{ fontSize: 11.5, color: "#8a8078" }}>{error}</span>
         </div>
       )}
       <div ref={mapDivRef} id={containerId} style={{ width: "100%", height: "100%" }} />

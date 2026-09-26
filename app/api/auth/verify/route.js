@@ -5,9 +5,10 @@
 // mobile app uses, and on success drops a signed httpOnly session cookie.
 //
 // The Firebase token is never stored — only the member identity Frappe
-// hands back, which is all the rest of the site needs.
+// hands back, plus whether that member sits on the board, which is what
+// decides who may create events.
 
-import { frappePost, FRAPPE_METHODS } from "@/lib/frappe";
+import { frappePost, isBoardMember, FRAPPE_METHODS } from "@/lib/frappe";
 import { setSessionCookie } from "@/lib/session";
 
 export async function POST(request) {
@@ -35,16 +36,21 @@ export async function POST(request) {
       );
     }
 
+    // Looked up once, here, and carried in the signed cookie afterwards.
+    const boardMember = await isBoardMember(member.id);
+
     await setSessionCookie({
       memberId: member.id,
       mobileNo: member.mobile_no,
       memberRole: member.member_role,
+      isBoardMember: boardMember,
     });
 
     return Response.json({
       memberId: member.id,
       mobileNo: member.mobile_no,
       memberRole: member.member_role,
+      isBoardMember: boardMember,
     });
   } catch (err) {
     return Response.json(

@@ -19,7 +19,7 @@ import { useRouter } from "next/navigation";
  * ------------------
  * Personal, residence, business and family details for one member.
  *
- * ON LOCATIONS
+ * ON LOCATIONSs
  * Four addresses on this page can carry a pin: the member's home, their
  * business, and the spouse's home and business. Rendering four 360px maps
  * at once buried the form and made every one of them fetch its own tiles,
